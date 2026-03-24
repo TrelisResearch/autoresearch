@@ -732,14 +732,17 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
 USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
-GATE_MIN       = 0.1    # leaky gate floor — prevents dead g=0 absorbing state
-LAMBDA_GATE    = 1e-3   # penalty on gate_mean of gated steps (k≥1); sweep: 1e-4, 1e-3, 5e-3, 1e-2
+GATE_MIN       = 0.0    # gate floor: 0 = free, 0.1 = leaky floor
+LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
+VAR_REWARD     = 0.1    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+                        # encourages per-token diversity (some high, some low) — fights uniform collapse
+K_RECURSE      = 2      # use K=2 for faster steps (~500ms vs ~940ms), more optimizer steps in 5 min
 LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p2b-gate-lambda1e-3"  # change per experiment
+RUN_NAME = "p2c-k2-varreward0.1"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -780,7 +783,7 @@ wandb.init(
     name=RUN_NAME,
     config=dict(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
-        lambda_gate=LAMBDA_GATE, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
+        lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
         embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
@@ -863,7 +866,8 @@ while True:
         with autocast_ctx:
             if USE_RECURSIVE:
                 ce, gate_mean_t, gate_std_t = model(x, y)
-                loss = ce + LAMBDA_GATE * gate_mean_t
+                # gate_mean penalty/reward + variance reward (rewards gate heterogeneity across tokens)
+                loss = ce + LAMBDA_GATE * gate_mean_t - VAR_REWARD * (gate_std_t ** 2)
                 gate_mean_accum += gate_mean_t.detach().item()
                 gate_std_accum += gate_std_t.detach().item()
             else:
