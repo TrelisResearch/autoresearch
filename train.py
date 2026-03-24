@@ -735,18 +735,17 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 # Recursive architecture
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
-USE_GATE       = False  # True = learned gate; False = always full update (g=1, simple recursion)
+USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
 GATE_MIN       = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
 VAR_REWARD     = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-LORA_RANK      = 8      # per-step LoRA rank (0=disabled); adds K×(2H×r + r×H) = 2×(1024×8+8×512) = 25K params
-                        # each step learns a different low-rank transformation → real step specialization
+LORA_RANK      = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K       = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3b-k2-randomK-lora8"  # change per experiment
+RUN_NAME = "p3c-k2-randomK-gate"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------

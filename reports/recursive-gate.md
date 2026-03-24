@@ -35,7 +35,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P2d | K=2, gate, var_reward=0.01 | 1.0561 | 0.1001 | 0.000 | 1.10 | 540 | K=2 wins on steps; var worked briefly |
 | P2e | K=2, gate, var_reward=0.05 | 1.0616 | 0.1001 | 0.000 | 1.10 | 541 | stronger var delayed collapse, slight penalty |
 | **P3a** | **K=2, RANDOM_K, no gate** | **1.0463** | 0.000 | 0.000 | 1.00 | **632** | **best recursive; RANDOM_K → more steps** |
-| P3b | K=2, RANDOM_K, LoRA=8 | TBD | — | — | — | ~600+ | running |
+| P3b | K=2, RANDOM_K, LoRA=8 | 1.6156 | 0.000 | 0.000 | 1.00 | ~600 | LoRA catastrophically hurt — see analysis |
+| P3c | K=2, RANDOM_K, gate on, λ=0 | TBD | — | — | — | ~600+ | running |
 
 ---
 
@@ -87,9 +88,20 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 - **gate_mean=0, gate_std=0** (USE_GATE=False by design)
 - **Finding**: RANDOM_K gives more optimizer steps AND teaches model both K depths
 
-### P3b — RANDOM_K=True + LoRA rank=8 per step (RUNNING)
+### P3b — RANDOM_K=True + LoRA rank=8 per step (FAILED)
+- **val_bpb: 1.616** (catastrophic — far worse than P3a's 1.046)
 - Adds K × (2H×8 + 8×H) = 25K params as per-step LoRA on inject
-- Hypothesis: LoRA makes each recurrence step truly distinct → K=2 beats K=1 more clearly for hard tokens
+- Hypothesis was: LoRA makes each recurrence step truly distinct → K=2 beats K=1 more clearly for hard tokens
+- **Why it failed**: LoRA added optimization complexity that conflicted badly with RANDOM_K
+  - With RANDOM_K, lora_B for step k only gets gradient when that step is active (50% of steps for K=2)
+  - The combined gradient landscape became very difficult to navigate
+  - LoRA adds K separate optimizer states that receive sparse, correlated gradients
+  - The model can't efficiently learn both the base inject weight AND per-step LoRA deltas under random K sampling
+- **Takeaway**: LoRA per-step and RANDOM_K are incompatible. Don't combine them.
+
+### P3c — RANDOM_K=True + gate on, no LoRA (RUNNING)
+- Hypothesis: RANDOM_K training exposes the model to both K=1 and K=2 → gate can learn which tokens benefit from K=2
+- Config: K=2, USE_GATE=True, LORA_RANK=0, RANDOM_K=True, LAMBDA_GATE=0.0, VAR_REWARD=0.0
 
 ---
 
