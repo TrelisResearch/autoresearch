@@ -13,9 +13,12 @@ import math
 import time
 from dataclasses import dataclass, asdict
 
+import wandb
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -291,6 +294,272 @@ class GPT(nn.Module):
         return logits
 
 # ---------------------------------------------------------------------------
+# RecursiveGPT — same blocks but recur segment runs K times (shared weights)
+# Architecture: prelude (2 layers) → recur (4 layers × K) → coda (2 layers)
+# Gate: g = gate_min + (1-gate_min)*sigmoid(gate_proj(cat[u,s])) ∈ [gate_min, 1]
+# Update: s = s + g*(u - s)   (step 0 always forced full update)
+# ---------------------------------------------------------------------------
+
+class RecursiveGPT(nn.Module):
+    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False):
+        super().__init__()
+        self.config = config
+        self.k_recurse = k_recurse
+        self.use_gate = use_gate
+        self.gate_min = gate_min
+        self.lora_rank = lora_rank
+        self.use_grad_ckpt = use_grad_ckpt
+        n_embd = config.n_embd
+        head_dim = n_embd // config.n_head
+        kv_dim = config.n_kv_head * head_dim
+
+        # Segment sizes — must sum to config.n_layer
+        self.n_pre = 2
+        self.n_rec = 4
+        self.n_cod = 2
+        assert self.n_pre + self.n_rec + self.n_cod == config.n_layer, \
+            f"Expected n_layer={self.n_pre+self.n_rec+self.n_cod}, got {config.n_layer}"
+
+        # Compute window sizes for all unique layers
+        ws = self._make_window_sizes(config)
+        self.pre_ws  = ws[:self.n_pre]
+        self.rec_ws  = ws[self.n_pre : self.n_pre + self.n_rec]
+        self.cod_ws  = ws[self.n_pre + self.n_rec :]
+
+        self.transformer = nn.ModuleDict({
+            "wte":    nn.Embedding(config.vocab_size, n_embd),
+            "pre":    nn.ModuleList([Block(config, i) for i in range(self.n_pre)]),
+            # Recur blocks: use layer_idx=0 so none get ve_gates (simplicity)
+            "rec":    nn.ModuleList([Block(config, 0) for _ in range(self.n_rec)]),
+            "cod":    nn.ModuleList([Block(config, self.n_pre + self.n_rec + i)
+                                     for i in range(self.n_cod)]),
+        })
+        self.lm_head = nn.Linear(n_embd, config.vocab_size, bias=False)
+
+        # Value embeddings for prelude (idx 0..n_pre-1) and coda (idx n_pre+n_rec..n_layer-1)
+        n_total = config.n_layer
+        ve_indices = [i for i in range(n_total)
+                      if i < self.n_pre or i >= self.n_pre + self.n_rec]
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(config.vocab_size, kv_dim)
+            for i in ve_indices if has_ve(i, n_total)
+        })
+
+        # Inject: fuse anchor e + current state s → input for recur block
+        # Init: weight = [I | 0] so inject(cat[e,s]) ≈ e at t=0
+        self.inject = nn.Linear(2 * n_embd, n_embd, bias=False)
+
+        # Gate: per-token scalar in [gate_min, 1], conditioned on proposed update u and state s
+        # Bias init +2 → sigmoid(2)≈0.88 → gate≈0.89 (mostly open at start)
+        self.gate_proj = nn.Linear(2 * n_embd, 1, bias=True)
+
+        # Learned step embeddings — broadcast over (B, T) at each recurrence step
+        # Critical: without these, shared weights see identical inputs every step
+        # Init to zero so step 0 is pure prelude output; learned over training
+        self.step_embeds = nn.Parameter(torch.zeros(k_recurse, n_embd))
+
+        # Optional per-step LoRA on inject (helps model distinguish recursion depth)
+        if lora_rank > 0:
+            self.lora_A = nn.Parameter(torch.zeros(k_recurse, 2 * n_embd, lora_rank))
+            self.lora_B = nn.Parameter(torch.zeros(k_recurse, lora_rank, n_embd))
+
+        # Rotary embeddings
+        self.rotary_seq_len = config.sequence_len * 10
+        cos, sin = self._precompute_rope(self.rotary_seq_len, head_dim)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def _make_window_sizes(self, config):
+        pattern = config.window_pattern.upper()
+        long_w, short_w = config.sequence_len, config.sequence_len // 2
+        char_map = {"L": (long_w, 0), "S": (short_w, 0)}
+        ws = [char_map[pattern[i % len(pattern)]] for i in range(config.n_layer)]
+        ws[-1] = (long_w, 0)
+        return ws
+
+    def _precompute_rope(self, seq_len, head_dim, base=10000, device=None):
+        if device is None:
+            device = self.transformer.wte.weight.device
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32,
+                                                  device=device) / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos = freqs.cos().bfloat16()[None, :, None, :]
+        sin = freqs.sin().bfloat16()[None, :, None, :]
+        return cos, sin
+
+    @torch.no_grad()
+    def init_weights(self):
+        n_embd = self.config.n_embd
+        s = 3**0.5 * n_embd**-0.5
+        torch.nn.init.normal_(self.transformer.wte.weight, 0.0, 1.0)
+        torch.nn.init.normal_(self.lm_head.weight, 0.0, 0.001)
+        for seg in [self.transformer.pre, self.transformer.rec, self.transformer.cod]:
+            for block in seg:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+                torch.nn.init.zeros_(block.attn.c_proj.weight)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.zeros_(block.mlp.c_proj.weight)
+                if block.attn.ve_gate is not None:
+                    torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        for ve in self.value_embeds.values():
+            torch.nn.init.uniform_(ve.weight, -s, s)
+        # Inject: identity-like init  [I | 0]
+        torch.nn.init.zeros_(self.inject.weight)
+        self.inject.weight.data[:, :n_embd].copy_(torch.eye(n_embd))
+        # Gate: bias +2 → gates start mostly open
+        torch.nn.init.zeros_(self.gate_proj.weight)
+        torch.nn.init.constant_(self.gate_proj.bias, 2.0)
+        if self.lora_rank > 0:
+            torch.nn.init.normal_(self.lora_A, 0.0, 0.01)
+            torch.nn.init.zeros_(self.lora_B)
+        # bf16 embeddings
+        self.transformer.wte.to(dtype=torch.bfloat16)
+        for ve in self.value_embeds.values():
+            ve.to(dtype=torch.bfloat16)
+        head_dim = self.config.n_embd // self.config.n_head
+        self.cos, self.sin = self._precompute_rope(self.rotary_seq_len, head_dim)
+
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+        n_embd = self.config.n_embd
+        dmodel_lr_scale = (n_embd / 768) ** -0.5
+        print(f"Scaling AdamW LRs by 1/sqrt({n_embd}/768) = {dmodel_lr_scale:.6f}")
+
+        # 2D matrix params → Muon (inject.weight is (H, 2H) → fine for Muon)
+        matrix_params = (list(self.transformer.pre.parameters()) +
+                         list(self.transformer.rec.parameters()) +
+                         list(self.transformer.cod.parameters()) +
+                         [self.inject.weight])
+        # gate_proj: weight shape (1, 2H) — not suitable for orthogonalisation → AdamW
+        gate_params = list(self.gate_proj.parameters()) if self.use_gate else []
+        # step_embeds and lora: scalar / small tensors → AdamW
+        step_params = [self.step_embeds]
+        lora_params = ([self.lora_A, self.lora_B] if self.lora_rank > 0 else [])
+        embedding_params = list(self.transformer.wte.parameters())
+        ve_params = list(self.value_embeds.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+
+        param_groups = [
+            dict(kind='adamw', params=lm_head_params,   lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=embedding_params,  lr=embedding_lr   * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=ve_params,         lr=embedding_lr   * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=step_params,       lr=scalar_lr      * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+        ]
+        if gate_params:
+            param_groups.append(dict(kind='adamw', params=gate_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        if lora_params:
+            param_groups.append(dict(kind='adamw', params=lora_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        for shape in sorted({p.shape for p in matrix_params}):
+            grp = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(dict(kind='muon', params=grp, lr=matrix_lr,
+                                     momentum=0.95, ns_steps=5, beta2=0.95,
+                                     weight_decay=weight_decay))
+        optimizer = MuonAdamW(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def num_scaling_params(self):
+        wte   = sum(p.numel() for p in self.transformer.wte.parameters())
+        ve    = sum(p.numel() for p in self.value_embeds.parameters())
+        lmh   = sum(p.numel() for p in self.lm_head.parameters())
+        pre   = sum(p.numel() for p in self.transformer.pre.parameters())
+        rec   = sum(p.numel() for p in self.transformer.rec.parameters())
+        cod   = sum(p.numel() for p in self.transformer.cod.parameters())
+        inj   = self.inject.weight.numel()
+        gate  = sum(p.numel() for p in self.gate_proj.parameters()) if self.use_gate else 0
+        step  = self.step_embeds.numel()
+        lora  = sum(p.numel() for p in [self.lora_A, self.lora_B]) if self.lora_rank > 0 else 0
+        total = wte + ve + lmh + pre + rec + cod + inj + gate + step + lora
+        return {'wte': wte, 'value_embeds': ve, 'lm_head': lmh,
+                'prelude': pre, 'recur(shared)': rec, 'coda': cod,
+                'inject': inj, 'gate_proj': gate, 'step_embeds': step, 'lora': lora, 'total': total}
+
+    def estimate_flops(self):
+        # Count effective FLOPs: recur block is run k_recurse times
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_embed = (self.transformer.wte.weight.numel() +
+                         sum(ve.weight.numel() for ve in self.value_embeds.values()))
+        h, q = self.config.n_head, self.config.n_embd // self.config.n_head
+        t = self.config.sequence_len
+        attn = 12 * h * q * t * (self.n_pre + self.n_rec * self.k_recurse + self.n_cod)
+        return 6 * (nparams - nparams_embed) + attn
+
+    def _run_recur_blocks(self, u, cos, sin):
+        """Run all shared recur blocks on u. Extracted as method for gradient checkpointing."""
+        cos_sin = (cos, sin)
+        for j, block in enumerate(self.transformer.rec):
+            u = block(u, None, cos_sin, self.rec_ws[j])
+        return u
+
+    def forward(self, idx, targets=None, reduction='mean'):
+        B, T = idx.size()
+        cos_sin = self.cos[:, :T], self.sin[:, :T]
+
+        x = self.transformer.wte(idx)
+        x = norm(x)
+
+        # --- Prelude (run once) ---
+        for i, block in enumerate(self.transformer.pre):
+            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.pre_ws[i])
+        e = x          # anchor: frozen context from prelude
+        s = e.clone()  # mutable recurrent state
+
+        # --- Recurrence (K steps, shared recur blocks) ---
+        gate_total = x.new_zeros(1)
+        for k in range(self.k_recurse):
+            # Fuse anchor + state, then inject step identity signal
+            u = self.inject(torch.cat([e, s], dim=-1))
+            u = u + self.step_embeds[k]   # broadcast (n_embd,) over (B, T, n_embd)
+            # Optional per-step LoRA delta on top of inject
+            if self.lora_rank > 0:
+                u = u + (torch.cat([e, s], dim=-1) @ self.lora_A[k]) @ self.lora_B[k]
+            # Run shared recur blocks (with optional gradient checkpointing to save activation memory)
+            if self.use_grad_ckpt:
+                u = grad_checkpoint(self._run_recur_blocks, u, cos_sin[0], cos_sin[1], use_reentrant=False)
+            else:
+                for j, block in enumerate(self.transformer.rec):
+                    u = block(u, None, cos_sin, self.rec_ws[j])
+            # Gate or full update
+            if not self.use_gate:
+                # Simple recursion baseline: always full update
+                s = u
+                gate_total = gate_total + x.new_ones(1)
+            elif k == 0:
+                # Step 0: forced full update (breaks chicken-and-egg for gated model)
+                s = u
+                gate_total = gate_total + x.new_ones(1)
+            else:
+                g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                    self.gate_proj(torch.cat([u, s], dim=-1)))
+                gate_total = gate_total + g.mean()
+                s = s + g * (u - s)
+
+        gate_mean = gate_total / self.k_recurse
+
+        # --- Coda (run once) ---
+        x = s
+        for i, block in enumerate(self.transformer.cod):
+            abs_i = self.n_pre + self.n_rec + i
+            ve = self.value_embeds[str(abs_i)](idx) if str(abs_i) in self.value_embeds else None
+            x = block(x, ve, cos_sin, self.cod_ws[i])
+
+        x = norm(x)
+        softcap = 15
+        logits = self.lm_head(x).float()
+        logits = softcap * torch.tanh(logits / softcap)
+
+        if targets is not None:
+            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
+                                 ignore_index=-1, reduction=reduction)
+            return ce, gate_mean   # caller adds lambda * gate_mean to loss
+        return logits
+
+# ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
 # ---------------------------------------------------------------------------
 
@@ -438,7 +707,7 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.06        # learning rate for matrix parameters (Muon) — 0.06 best from initial-tests
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
@@ -447,8 +716,22 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
+DEPTH = 8               # number of transformer layers (ignored when USE_RECURSIVE=True)
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+
+# Recursive architecture
+USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
+K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
+USE_GATE       = False  # True = learned gate; False = always full update (g=1, simple recursion)
+GATE_MIN       = 0.1    # leaky gate floor — prevents dead g=0 absorbing state
+LAMBDA_GATE    = 0.0    # penalty on gate_mean (0=disabled; try 1e-3..5e-3 for gating)
+LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
+USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
+# When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
+
+# Experiment tracking
+RUN_NAME = "b2-recursive-k4-no-gate-bs128"  # change per experiment
+WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -476,11 +759,33 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
     )
 
-config = build_model_config(DEPTH)
+# For recursive model, unique layer count = 2+4+2=8; for standard use DEPTH
+_depth = (2 + 4 + 2) if USE_RECURSIVE else DEPTH
+config = build_model_config(_depth)
 print(f"Model config: {asdict(config)}")
+print(f"Mode: {'RECURSIVE K=' + str(K_RECURSE) + ' lambda=' + str(LAMBDA_GATE) + ' lora_rank=' + str(LORA_RANK) if USE_RECURSIVE else 'STANDARD'}")
+
+wandb.login(key=os.environ.get("WANDB_API_KEY"))
+wandb.init(
+    project=WANDB_PROJECT,
+    name=RUN_NAME,
+    config=dict(
+        use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
+        lambda_gate=LAMBDA_GATE, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
+        depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
+        window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
+        embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
+        matrix_lr=MATRIX_LR, scalar_lr=SCALAR_LR, weight_decay=WEIGHT_DECAY,
+        adam_betas=ADAM_BETAS, warmup_ratio=WARMUP_RATIO,
+        warmdown_ratio=WARMDOWN_RATIO, final_lr_frac=FINAL_LR_FRAC,
+    ),
+)
 
 with torch.device("meta"):
-    model = GPT(config)
+    if USE_RECURSIVE:
+        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT)
+    else:
+        model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -543,13 +848,20 @@ step = 0
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
+    gate_mean_accum = 0.0
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if USE_RECURSIVE:
+                ce, gate_mean_t = model(x, y)
+                loss = ce + LAMBDA_GATE * gate_mean_t
+                gate_mean_accum += gate_mean_t.detach().item()
+            else:
+                loss = model(x, y)
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
         x, y, epoch = next(train_loader)
+    gate_mean_val = gate_mean_accum / grad_accum_steps if USE_RECURSIVE else 0.0
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -587,7 +899,16 @@ while True:
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    gate_str = f" | gate: {gate_mean_val:.3f}" if USE_RECURSIVE else ""
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}%{gate_str} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+    if step % 10 == 0:
+        log_dict = {"train/loss": debiased_smooth_loss, "train/lrm": lrm,
+                    "train/mfu": mfu, "train/tok_per_sec": tok_per_sec,
+                    "train/step_ms": dt * 1000}
+        if USE_RECURSIVE:
+            log_dict["train/gate_mean"] = gate_mean_val
+        wandb.log(log_dict, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -610,13 +931,49 @@ total_tokens = step * TOTAL_BATCH_SIZE
 # Final eval
 model.eval()
 with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    if USE_RECURSIVE:
+        # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean) tuple
+        class _CEOnlyModel:
+            def __call__(self, x, y, reduction='mean'):
+                ce, _ = model(x, y, reduction=reduction)
+                return ce
+        val_bpb = evaluate_bpb(_CEOnlyModel(), tokenizer, DEVICE_BATCH_SIZE)
+    else:
+        val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+# Compute final gate_mean from last eval pass if recursive
+final_gate_mean = 0.0
+if USE_RECURSIVE:
+    # Re-run a small eval pass to get a stable gate_mean at eval time
+    model.eval()
+    with autocast_ctx, torch.no_grad():
+        # Grab one eval batch for gate measurement
+        eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
+        ex, ey, _ = next(eval_loader)
+        _, gm = model(ex.to(device), ey.to(device))
+        final_gate_mean = gm.item()
+    model.train()
+
+final_log = {
+    "final/val_bpb": val_bpb,
+    "final/training_seconds": total_training_time,
+    "final/peak_vram_mb": peak_vram_mb,
+    "final/mfu_percent": steady_state_mfu,
+    "final/total_tokens_M": total_tokens / 1e6,
+    "final/num_steps": step,
+    "final/num_params_M": num_params / 1e6,
+}
+if USE_RECURSIVE:
+    final_log["final/gate_mean"] = final_gate_mean
+    final_log["final/effective_k"] = 1 + final_gate_mean * (K_RECURSE - 1)
+wandb.log(final_log)
+wandb.finish()
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")
@@ -627,4 +984,7 @@ print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+print(f"depth:            {_depth}")
+if USE_RECURSIVE:
+    print(f"gate_mean:        {final_gate_mean:.4f}")
+    print(f"effective_k:      {1 + final_gate_mean * (K_RECURSE - 1):.2f}")
