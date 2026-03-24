@@ -52,6 +52,7 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P3R | symmetric inject, var_reward=0, gate_min=0.5 | FAIL/1.043 | 0.5+ | ~0 | — | ~135/641 | NaN at step 135; then P3R2 with gate_min=0.3 ran ok |
 | P3R2 | symmetric inject, var_reward=0, gate_min=0.3 (forced open) | 1.0433 | 0.3009 | 0.002 | 1.20 | 641 | no VAR_REWARD → gate_std≈0; uniform forced compute doesn't help vs floor |
 | P3S | identity inject, var_reward=0.5 | 1.0551 | 0.5430 | 0.4499 | 1.54 | 638 | **ablation: VAR_REWARD=0.5 alone sufficient — symmetric inject NOT required** |
+| P3P2 | symmetric inject, var_reward=0.5 + **threshold sweep** | 1.0563 | 0.5352 | 0.4497 | 1.54 | 629 | Gate threshold sweep — see Phase 4 |
 
 ---
 
@@ -178,6 +179,34 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 6. **Gate collapse root cause**: at init, inject(cat[e,s])=e (ignores s), so (u-s)≈0 for gated steps → CE gradient through gate ≈ 0 → lambda or noise dominates → instant floor collapse. Fix: LoRA makes (u-s) meaningful from step 0.
 
 7. **Val_bpb vs steps trade-off**: in 5-min budget, B1=924 steps→0.996, P3a=632 steps→1.046, B2b=331 steps→1.117. Strong linear relationship between steps and quality.
+
+## Phase 4: Threshold Sweep (P3P2)
+
+### Inference compute vs quality trade-off
+
+Trained P3P config (VAR_REWARD=0.5, symmetric inject) then swept gate threshold τ at inference.
+When gate < τ: token skips second recurrence (g set to 0 → s unchanged). Measures actual compute savings.
+
+| threshold | skip% | eff_k | val_bpb | note |
+|---|---|---|---|---|
+| 0.0 | 0% | 2.00 | 1.056283 | full K=2 |
+| 0.2 | 51.4% | 1.49 | 1.056775 | ← **bimodal!** jumps immediately |
+| 0.4 | 51.4% | 1.49 | 1.056775 | no change |
+| 0.5 | 51.5% | 1.49 | 1.056775 | no change |
+| 0.8 | 51.5% | 1.49 | 1.056775 | no change |
+| 1.0 | 51.5% | 1.49 | 1.056774 | K=1 equiv |
+| **P3a ref** | ~50% | ~1.50 | **1.0463** | RANDOM_K no-gate baseline |
+
+**Key findings:**
+1. **Gate is bimodal**: 51.5% of tokens near floor (~0.1), 48.5% near ceiling (~0.9). VAR_REWARD drives the gate to two extremes rather than a continuum. Threshold at τ=0.2 already captures the full split.
+2. **Skipping low-gate tokens costs only 0.0005 bpb**: those tokens already had g≈0.1 (10% update), so skipping them is nearly equivalent to having them.
+3. **Soft gate → real compute savings at inference**: at τ=0.5, skip 51.5% of second recurrences → effective_k=1.49. This is a real inference speedup (~25% savings on recur compute). No architectural change needed — just set threshold at inference time.
+4. **But training noise still dominates**: even the full gated model (1.056) is worse than P3a no-gate (1.046). VAR_REWARD costs ~0.010 bpb in training quality.
+5. **The gate IS adaptive**: model genuinely learned to split tokens into "needs more compute" (49%) vs "doesn't" (51%). Hypothesis: this split would emerge naturally with longer training, making VAR_REWARD unnecessary.
+
+**Compute savings at τ=0.5**: effectively 1.49 recurrences vs P3a's ~1.5. Comparable compute, but gated model is worse due to VAR_REWARD noise. The approach works architecturally; the training signal needs improvement.
+
+---
 
 ## Next Directions (Phase 2 continued)
 

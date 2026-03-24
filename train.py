@@ -27,7 +27,8 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_dataloader, evaluate_bpb, get_token_bytes
+from prepare import MAX_SEQ_LEN, TIME_BUDGET as _BASE_TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_dataloader, evaluate_bpb, get_token_bytes
+TIME_BUDGET = _BASE_TIME_BUDGET  # override below for longer runs
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -781,7 +782,7 @@ GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates ga
 GATE_MIN          = 0.1    # standard floor
 GATE_MIN_INIT     = 0.1    # no curriculum
 LAMBDA_GATE       = 0.0    # no penalty
-VAR_REWARD        = 0.5    # P3P config — VAR_REWARD=0.5 gives gate_std≈0.45; retrain to get threshold sweep
+VAR_REWARD        = 0.0    # P4a: no VAR_REWARD — test if 20min training sustains gate naturally
 STEP_EMBED_SCALE  = 0.1    # larger step_embeds → bigger (u-s) → stronger gate gradient
 INJECT_INIT       = "symmetric"  # symmetric inject for strong early gate gradient signal
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
@@ -790,7 +791,8 @@ USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× act
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3P2-sweep"  # P3P retrain + gate threshold sweep to measure inference compute vs quality
+TIME_BUDGET = 1200  # 20-minute run: 4× longer than standard — test if gate opens naturally without VAR_REWARD
+RUN_NAME = "p4a-20min-no-var"  # long run: hypothesis gates stay open with enough training signal
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
