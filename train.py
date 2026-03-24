@@ -27,7 +27,7 @@ cap = torch.cuda.get_device_capability()
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
 fa3 = get_kernel(repo).flash_attn_interface
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer, make_dataloader, evaluate_bpb, get_token_bytes
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -307,7 +307,7 @@ class RecursiveGPT(nn.Module):
         self.config = config
         self.k_recurse = k_recurse
         self.use_gate = use_gate
-        self.gate_min = gate_min
+        self.gate_min = gate_min  # Python float — used only at init/for serialization
         self.lora_rank = lora_rank
         self.use_grad_ckpt = use_grad_ckpt
         self.gate_from_prelude = gate_from_prelude
@@ -359,6 +359,9 @@ class RecursiveGPT(nn.Module):
         # Bias init +2 → sigmoid(2)≈0.88 → gate≈0.89 (mostly open at start)
         gate_in_dim = n_embd if (gate_from_prelude or gate_from_diff) else 2 * n_embd
         self.gate_proj = nn.Linear(gate_in_dim, 1, bias=True)
+        # _gate_min_t: tensor buffer for gate floor — use in-place .fill_() to update without triggering
+        # torch.compile recompilation (changing a Python float self.gate_min would recompile every step)
+        self.register_buffer('_gate_min_t', torch.tensor(gate_min, dtype=torch.float32))
 
         # Learned step embeddings — broadcast over (B, T) at each recurrence step
         # Critical: without these, shared weights see identical inputs every step
@@ -417,9 +420,15 @@ class RecursiveGPT(nn.Module):
                     torch.nn.init.zeros_(block.attn.ve_gate.weight)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
-        # Inject: identity-like init  [I | 0]
-        torch.nn.init.zeros_(self.inject.weight)
-        self.inject.weight.data[:, :n_embd].copy_(torch.eye(n_embd))
+        # Inject init: controlled by INJECT_INIT global
+        # "identity": [I | 0] — inject ignores s at init; slow to learn s-dependence → k=1≈k=0
+        # "symmetric": [0.5*I | 0.5*I] — inject blends e+s equally → k=1 refines based on k=0 output
+        if INJECT_INIT == "symmetric":
+            self.inject.weight.data[:, :n_embd] = 0.5 * torch.eye(n_embd)
+            self.inject.weight.data[:, n_embd:] = 0.5 * torch.eye(n_embd)
+        else:
+            torch.nn.init.zeros_(self.inject.weight)
+            self.inject.weight.data[:, :n_embd].copy_(torch.eye(n_embd))
         # Gate: bias +2 → gates start mostly open
         torch.nn.init.zeros_(self.gate_proj.weight)
         torch.nn.init.constant_(self.gate_proj.bias, 2.0)
@@ -506,7 +515,7 @@ class RecursiveGPT(nn.Module):
             u = block(u, None, cos_sin, self.rec_ws[j])
         return u
 
-    def forward(self, idx, targets=None, reduction='mean', k_override=None):
+    def forward(self, idx, targets=None, reduction='mean', k_override=None, gate_threshold=0.0):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         k_recurse = k_override if k_override is not None else self.k_recurse
@@ -530,9 +539,10 @@ class RecursiveGPT(nn.Module):
         n_gated = 0
         # gate_from_prelude: compute per-token gate once from e before the loop
         # This bypasses the (u-s)≈0 gradient collapse — e is well-defined from the prelude
+        gmin = self._gate_min_t  # tensor buffer — update in-place to avoid torch.compile recompilation
         g_prelude = None
         if self.use_gate and self.gate_from_prelude and k_recurse > 1:
-            g_prelude = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+            g_prelude = gmin + (1 - gmin) * torch.sigmoid(
                 self.gate_proj(e))  # (B, T, 1) — same gate applied to all k≥1
         for k in range(k_recurse):
             # Fuse anchor + state, then inject step identity signal
@@ -553,14 +563,16 @@ class RecursiveGPT(nn.Module):
                 s = u
             else:
                 if self.gate_from_prelude:
-                    g = g_prelude  # computed once from e above
+                    # Apply hard threshold at inference: tokens with g < threshold skip recurrence
+                    g = g_prelude if gate_threshold <= 0.0 else torch.where(
+                        g_prelude >= gate_threshold, g_prelude, torch.zeros_like(g_prelude))
                 elif self.gate_from_diff:
                     # Gate from (u-s): token-specific because s varies per-token after k=0
                     # Semantically: "how different is the proposed update from current state?"
-                    g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                    g = gmin + (1 - gmin) * torch.sigmoid(
                         self.gate_proj(u - s))
                 else:
-                    g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                    g = gmin + (1 - gmin) * torch.sigmoid(
                         self.gate_proj(torch.cat([u, s], dim=-1)))
                 gate_sum = gate_sum + g.mean()
                 gate_sq_sum = gate_sq_sum + g.square().mean()
@@ -575,6 +587,12 @@ class RecursiveGPT(nn.Module):
         else:
             gate_mean = x.new_zeros(1)
             gate_std = x.new_zeros(1)
+        # skip_frac: fraction of tokens that would be skipped at this gate_threshold
+        # g_prelude is computed before the loop; skip = gate < threshold
+        if g_prelude is not None and gate_threshold > 0.0:
+            skip_frac = (g_prelude < gate_threshold).float().mean()
+        else:
+            skip_frac = x.new_zeros(1)
 
         # --- Coda (run once) ---
         x = s
@@ -591,7 +609,7 @@ class RecursiveGPT(nn.Module):
         if targets is not None:
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                  ignore_index=-1, reduction=reduction)
-            return ce, gate_mean, gate_std   # caller adds lambda * gate_mean to loss
+            return ce, gate_mean, gate_std, skip_frac   # caller adds lambda * gate_mean to loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -758,19 +776,21 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
 USE_GATE          = True   # True = learned gate; False = always full update (g=1, simple recursion)
-GATE_FROM_PRELUDE = False  # True = gate from prelude e; False → check GATE_FROM_DIFF
-GATE_FROM_DIFF    = True   # True = gate from (u-s) update difference — token-specific, naturally non-zero
-GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
-LAMBDA_GATE       = 0.0    # penalty on gate_mean; 0 = no penalty
-VAR_REWARD        = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-STEP_EMBED_SCALE  = 0.02   # step_embeds init scale; P3k: 0.02 (0.1 caused NaN via gate_from_diff instability)
+GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
+GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
+GATE_MIN          = 0.1    # standard floor
+GATE_MIN_INIT     = 0.1    # no curriculum
+LAMBDA_GATE       = 0.0    # no penalty
+VAR_REWARD        = 0.5    # P3P config — VAR_REWARD=0.5 gives gate_std≈0.45; retrain to get threshold sweep
+STEP_EMBED_SCALE  = 0.1    # larger step_embeds → bigger (u-s) → stronger gate gradient
+INJECT_INIT       = "symmetric"  # symmetric inject for strong early gate gradient signal
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3k-k2-randomK-gate-from-diff"  # change per experiment
+RUN_NAME = "p3P2-sweep"  # P3P retrain + gate threshold sweep to measure inference compute vs quality
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -810,7 +830,7 @@ wandb.init(
     project=WANDB_PROJECT,
     name=RUN_NAME,
     config=dict(
-        use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
+        use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN, gate_min_init=GATE_MIN_INIT, inject_init=INJECT_INIT,
         lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
         lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
         gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
@@ -896,7 +916,7 @@ while True:
         with autocast_ctx:
             if USE_RECURSIVE:
                 k_eff = random.randint(1, K_RECURSE) if RANDOM_K else K_RECURSE
-                ce, gate_mean_t, gate_std_t = model(x, y, k_override=k_eff)
+                ce, gate_mean_t, gate_std_t, _ = model(x, y, k_override=k_eff)
                 # gate_mean penalty/reward + variance reward (rewards gate heterogeneity across tokens)
                 loss = ce + LAMBDA_GATE * gate_mean_t - VAR_REWARD * (gate_std_t ** 2)
                 gate_mean_accum += gate_mean_t.detach().item()
@@ -915,6 +935,10 @@ while True:
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(progress)
+    # Gate-min curriculum: decay gate_min from GATE_MIN_INIT → GATE_MIN over training
+    # Use in-place fill_ to avoid torch.compile recompilation (buffer tensor identity unchanged)
+    if USE_RECURSIVE and USE_GATE and hasattr(model, '_gate_min_t'):
+        model._gate_min_t.fill_(GATE_MIN + (GATE_MIN_INIT - GATE_MIN) * (1.0 - progress))
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
@@ -983,7 +1007,7 @@ with autocast_ctx:
         # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean, gate_std) tuple
         class _CEOnlyModel:
             def __call__(self, x, y, reduction='mean'):
-                ce, _, __ = model(x, y, reduction=reduction)
+                ce, _, __, ___ = model(x, y, reduction=reduction)
                 return ce
         val_bpb = evaluate_bpb(_CEOnlyModel(), tokenizer, DEVICE_BATCH_SIZE)
     else:
@@ -1003,7 +1027,7 @@ if USE_RECURSIVE:
     with autocast_ctx, torch.no_grad():
         eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
         ex, ey, _ = next(eval_loader)
-        _, gm, gs = model(ex.to(device), ey.to(device))
+        _, gm, gs, _ = model(ex.to(device), ey.to(device))
         final_gate_mean = gm.item()
         final_gate_std = gs.item()
     model.train()
@@ -1022,6 +1046,45 @@ if USE_RECURSIVE:
     final_log["final/gate_std"] = final_gate_std
     final_log["final/effective_k"] = 1 + final_gate_mean * (K_RECURSE - 1)
 wandb.log(final_log)
+
+# ---------------------------------------------------------------------------
+# Gate threshold sweep (inference compute vs quality trade-off)
+# Only runs when USE_GATE=True and gate actually differentiates tokens (gate_std > 0.05)
+# Uses model._orig_mod to bypass torch.compile — no recompilation needed
+# ---------------------------------------------------------------------------
+if USE_RECURSIVE and USE_GATE and final_gate_std > 0.05 and K_RECURSE > 1:
+    print("\n--- Gate Threshold Sweep (inference compute vs val_bpb) ---")
+    print(f"{'threshold':>10} {'skip%':>8} {'eff_k':>7} {'val_bpb':>12}  note")
+    _orig = getattr(model, '_orig_mod', model)
+    _orig.eval()
+    _token_bytes = get_token_bytes(device=device)
+    _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+    _sweep_log = {}
+    for _tau in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
+        _total_nats = 0.0; _total_bytes = 0; _total_skip = 0.0
+        _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
+        with torch.no_grad(), autocast_ctx:
+            for _ in range(_sweep_steps):
+                _x, _y, _ = next(_val_loader)
+                _ce, _, __, _sf = _orig(_x.to(device), _y.to(device), reduction='none', gate_threshold=_tau)
+                _loss_flat = _ce.view(-1)
+                _y_flat = _y.view(-1)
+                _nb = _token_bytes[_y_flat]
+                _mask = _nb > 0
+                _total_nats += (_loss_flat * _mask).sum().item()
+                _total_bytes += _nb.sum().item()
+                _total_skip += _sf.item()
+        _bpb = _total_nats / (math.log(2) * _total_bytes)
+        _avg_skip = _total_skip / _sweep_steps
+        _eff_k = 1 + (1 - _avg_skip) * (K_RECURSE - 1)
+        _note = " ← full K=2" if _tau == 0.0 else (" ← K=1 equiv" if _tau == 1.0 else "")
+        print(f"{_tau:>10.1f} {100*_avg_skip:>7.1f}% {_eff_k:>7.2f} {_bpb:>12.6f}{_note}")
+        _sweep_log[f"sweep/tau{_tau:.1f}_bpb"] = _bpb
+        _sweep_log[f"sweep/tau{_tau:.1f}_skip_pct"] = 100 * _avg_skip
+        _sweep_log[f"sweep/tau{_tau:.1f}_eff_k"] = _eff_k
+    print(f"{'P3a ref':>10} {'~50%':>8} {'~1.50':>7} {'1.046300':>12}  RANDOM_K no-gate baseline")
+    wandb.log(_sweep_log)
+
 wandb.finish()
 
 print("---")

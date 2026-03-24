@@ -38,7 +38,20 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P3b | K=2, RANDOM_K, LoRA=8 | 1.6156 | 0.000 | 0.000 | 1.00 | ~600 | LoRA catastrophically hurt — see analysis |
 | P3c | K=2, RANDOM_K, gate on, λ=0 | 1.0441 | 0.1001 | 0.000 | 1.10 | 630 | gate collapsed same as P2a — RANDOM_K helps steps but not gate |
 | **P3d** | **K=2, RANDOM_K, gate_from_prelude** | **1.0399** | 0.1001 | 0.000 | 1.10 | **641** | **new best; gate_std=0.16-0.39 early then collapsed** |
-| P3e | K=2, RANDOM_K, gate_from_prelude, var_reward=0.05 | TBD | — | — | — | ~640 | running |
+| P3e | K=2, RANDOM_K, gate_from_prelude, var_reward=0.05 | 1.0432 | 0.1001 | 0.029 | 1.10 | ~640 | gate_std sustained at 0.029! First breakthrough — gate differentiates tokens |
+| P3i | gate_from_prelude, step_embed_scale=0.1 | — | — | — | — | — | gate_mean 0.35-0.70 early, then collapsed; scale=0.1 too large? |
+| P3j | gate_from_prelude, LAMBDA_GATE=-0.05 | FAIL | — | — | — | 174 | NaN at step 174; negative lambda destabilizes when CE is low |
+| P3k | gate_from_diff, scale=0.1, grad_ckpt=True | FAIL | — | — | — | 3 | NaN at step 3; gate oscillates wildly (0.9→0→1.0→NaN) |
+| P3k2 | gate_from_diff, scale=0.02, grad_ckpt=True | 1.0418 | 0.1001 | 0.000 | 1.10 | 637 | scale too small, gate_std=0.000 immediately |
+| P3k3 | gate_from_diff, scale=0.1, grad_ckpt=False | FAIL | — | — | — | 4 | same NaN: grad_ckpt was NOT the cause; gate_from_diff inherently unstable at scale=0.1 |
+| P3L | gate_from_prelude, scale=0.1, var=0.05 | 1.0426 | 0.1011 | 0.029 | 1.10 | 635 | same as P3e despite scale=0.1; gate sustained but at floor |
+| P3N2 | gate_from_prelude, scale=0.1, var=0.05, gate_min curriculum 0.5→0.1 | 1.0440 | 0.1016 | 0.032 | 1.10 | 637 | curriculum forces gates open early (0.7-0.8 at start); still collapses to floor |
+| P3O | symmetric inject [0.5I\|0.5I], gate_from_prelude, scale=0.1, var=0.05 | 1.0426 | 0.1011 | 0.032 | 1.10 | 638 | gate collapsed to floor same as P3L — symmetric inject alone doesn't sustain gate |
+| **P3P** | **symmetric inject, var_reward=0.5** | **1.0530** | **0.5547** | **0.4499** | **1.55** | **645** | **BREAKTHROUGH: first sustained gate_mean≈0.55, gate_std≈0.45** |
+| P3Q | symmetric inject, var_reward=0.5, gate_min=0.3 | 1.0550 | 0.5791 | 0.4467 | 1.58 | 641 | gate_min=0.3 floor shifts mean slightly but same quality; var=0.5 needed |
+| P3R | symmetric inject, var_reward=0, gate_min=0.5 | FAIL/1.043 | 0.5+ | ~0 | — | ~135/641 | NaN at step 135; then P3R2 with gate_min=0.3 ran ok |
+| P3R2 | symmetric inject, var_reward=0, gate_min=0.3 (forced open) | 1.0433 | 0.3009 | 0.002 | 1.20 | 641 | no VAR_REWARD → gate_std≈0; uniform forced compute doesn't help vs floor |
+| P3S | identity inject, var_reward=0.5 | 1.0551 | 0.5430 | 0.4499 | 1.54 | 638 | **ablation: VAR_REWARD=0.5 alone sufficient — symmetric inject NOT required** |
 
 ---
 
