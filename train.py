@@ -732,17 +732,18 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
 USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
-GATE_MIN       = 0.0    # gate floor: 0 = free, 0.1 = leaky floor
+GATE_MIN       = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD     = 0.1    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+VAR_REWARD     = 0.01   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
                         # encourages per-token diversity (some high, some low) — fights uniform collapse
+                        # 0.1 was too aggressive → gate oscillated → NaN at step 4; 0.01 = gentler nudge
 K_RECURSE      = 2      # use K=2 for faster steps (~500ms vs ~940ms), more optimizer steps in 5 min
 LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p2c-k2-varreward0.1"  # change per experiment
+RUN_NAME = "p2d-k2-varreward0.01"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
