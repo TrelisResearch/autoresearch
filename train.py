@@ -752,14 +752,14 @@ USE_GATE          = True   # True = learned gate; False = always full update (g=
 GATE_FROM_PRELUDE = True   # True = gate from prelude e (bypasses (u-s)≈0 collapse); False = gate from cat[u,s]
 GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE       = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD        = 0.05   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+VAR_REWARD        = 0.01   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
-RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
+RANDOM_K          = False  # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3e-k2-randomK-gfp-varreward0.05"  # change per experiment
+RUN_NAME = "p3f-k2-gfp-varreward0.01-noRandomK"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
