@@ -302,7 +302,7 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RecursiveGPT(nn.Module):
-    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False):
+    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False, gate_from_diff=False):
         super().__init__()
         self.config = config
         self.k_recurse = k_recurse
@@ -311,6 +311,7 @@ class RecursiveGPT(nn.Module):
         self.lora_rank = lora_rank
         self.use_grad_ckpt = use_grad_ckpt
         self.gate_from_prelude = gate_from_prelude
+        self.gate_from_diff = gate_from_diff
         n_embd = config.n_embd
         head_dim = n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -353,9 +354,10 @@ class RecursiveGPT(nn.Module):
 
         # Gate: per-token scalar in [gate_min, 1]
         # gate_from_prelude=True: conditioned on prelude output e (bypasses (u-s)≈0 collapse)
-        # gate_from_prelude=False: conditioned on cat[u, s] (proposed update + state)
+        # gate_from_diff=True: conditioned on (u-s) = update difference — token-specific, non-zero when step_embeds≠0
+        # else: conditioned on cat[u, s] (proposed update + state)
         # Bias init +2 → sigmoid(2)≈0.88 → gate≈0.89 (mostly open at start)
-        gate_in_dim = n_embd if gate_from_prelude else 2 * n_embd
+        gate_in_dim = n_embd if (gate_from_prelude or gate_from_diff) else 2 * n_embd
         self.gate_proj = nn.Linear(gate_in_dim, 1, bias=True)
 
         # Learned step embeddings — broadcast over (B, T) at each recurrence step
@@ -552,6 +554,11 @@ class RecursiveGPT(nn.Module):
             else:
                 if self.gate_from_prelude:
                     g = g_prelude  # computed once from e above
+                elif self.gate_from_diff:
+                    # Gate from (u-s): token-specific because s varies per-token after k=0
+                    # Semantically: "how different is the proposed update from current state?"
+                    g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                        self.gate_proj(u - s))
                 else:
                     g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
                         self.gate_proj(torch.cat([u, s], dim=-1)))
@@ -751,18 +758,19 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
 USE_GATE          = True   # True = learned gate; False = always full update (g=1, simple recursion)
-GATE_FROM_PRELUDE = True   # True = gate from prelude e (bypasses (u-s)≈0 collapse); False = gate from cat[u,s]
+GATE_FROM_PRELUDE = False  # True = gate from prelude e; False → check GATE_FROM_DIFF
+GATE_FROM_DIFF    = True   # True = gate from (u-s) update difference — token-specific, naturally non-zero
 GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
-LAMBDA_GATE       = -0.05  # penalty on gate_mean; negative = reward open gates, prevents floor collapse
-VAR_REWARD        = 0.01   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-STEP_EMBED_SCALE  = 0.1    # step_embeds init scale; larger → bigger (u-s) → gate has more signal early
+LAMBDA_GATE       = 0.0    # penalty on gate_mean; 0 = no penalty
+VAR_REWARD        = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+STEP_EMBED_SCALE  = 0.1    # step_embeds init scale; 0.1 → (u-s) ≈ 0.1-scale at init → gate has real signal
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3j-k2-randomK-gfp-lambda-0.05"  # change per experiment
+RUN_NAME = "p3k-k2-randomK-gate-from-diff"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -805,7 +813,7 @@ wandb.init(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
         lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
         lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
-        step_embed_scale=STEP_EMBED_SCALE,
+        gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
         embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
@@ -817,7 +825,7 @@ wandb.init(
 
 with torch.device("meta"):
     if USE_RECURSIVE:
-        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE)
+        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE, gate_from_diff=GATE_FROM_DIFF)
     else:
         model = GPT(config)
 model.to_empty(device=device)
