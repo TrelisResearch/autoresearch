@@ -10,6 +10,7 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
+import random
 import time
 from dataclasses import dataclass, asdict
 
@@ -495,9 +496,10 @@ class RecursiveGPT(nn.Module):
             u = block(u, None, cos_sin, self.rec_ws[j])
         return u
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', k_override=None):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
+        k_recurse = k_override if k_override is not None else self.k_recurse
 
         x = self.transformer.wte(idx)
         x = norm(x)
@@ -516,7 +518,7 @@ class RecursiveGPT(nn.Module):
         gate_sum = x.new_zeros(1)
         gate_sq_sum = x.new_zeros(1)
         n_gated = 0
-        for k in range(self.k_recurse):
+        for k in range(k_recurse):
             # Fuse anchor + state, then inject step identity signal
             u = self.inject(torch.cat([e, s], dim=-1))
             u = u + self.step_embeds[k]   # broadcast (n_embd,) over (B, T, n_embd)
@@ -541,7 +543,7 @@ class RecursiveGPT(nn.Module):
                 n_gated += 1
                 s = s + g * (u - s)
 
-        # gate_mean over gated steps only (k=1..K-1); 0 if no gated steps
+        # gate_mean over gated steps only (k=1..k_recurse-1); 0 if no gated steps
         if n_gated > 0:
             gate_mean = gate_sum / n_gated
             gate_var = gate_sq_sum / n_gated - (gate_sum / n_gated) ** 2
@@ -734,16 +736,17 @@ K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
 USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
 GATE_MIN       = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD     = 0.01   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-                        # encourages per-token diversity (some high, some low) — fights uniform collapse
-                        # 0.1 was too aggressive → gate oscillated → NaN at step 4; 0.01 = gentler nudge
+VAR_REWARD     = 0.05   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+                        # 0.01 → gate_std≈0.3 early then collapsed; 0.05 = 5× stronger nudge
 K_RECURSE      = 2      # use K=2 for faster steps (~500ms vs ~940ms), more optimizer steps in 5 min
 LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
+RANDOM_K       = False  # if True: randomly sample K_eff in [1, K_RECURSE] each step during training
+                        # model learns CE at all K depths → natural basis for per-token gate assignment
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p2d-k2-varreward0.01"  # change per experiment
+RUN_NAME = "p2e-k2-varreward0.05"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -784,7 +787,8 @@ wandb.init(
     name=RUN_NAME,
     config=dict(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
-        lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
+        lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
+        lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
         embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
@@ -866,7 +870,8 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             if USE_RECURSIVE:
-                ce, gate_mean_t, gate_std_t = model(x, y)
+                k_eff = random.randint(1, K_RECURSE) if RANDOM_K else K_RECURSE
+                ce, gate_mean_t, gate_std_t = model(x, y, k_override=k_eff)
                 # gate_mean penalty/reward + variance reward (rewards gate heterogeneity across tokens)
                 loss = ce + LAMBDA_GATE * gate_mean_t - VAR_REWARD * (gate_std_t ** 2)
                 gate_mean_accum += gate_mean_t.detach().item()
