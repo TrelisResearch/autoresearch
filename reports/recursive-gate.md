@@ -26,11 +26,16 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 
 ## Results Summary
 
-| Exp | Description | val_bpb | gate_mean | effective_k | steps | notes |
-|---|---|---|---|---|---|---|
-| **B1** | Standard GPT, depth=8, matrix_lr=0.06 | **0.9964** | — | 1.00 | 924 | reference baseline |
-| B2b | RecursiveGPT K=4, no gate, BS=128+grad_ckpt | 1.1167 | 1.0000 | 4.00 | 331 | 3× slower/step than B1 → fewer steps |
-| P2a | USE_GATE=True, LAMBDA_GATE=0 | 1.1170 | 0.3242 | 1.97 | 325 | gate collapsed to floor instantly |
+| Exp | Description | val_bpb | gate_mean | gate_std | effective_k | steps | notes |
+|---|---|---|---|---|---|---|---|
+| **B1** | Standard GPT, depth=8, matrix_lr=0.06 | **0.9964** | — | — | 1.00 | 924 | reference baseline |
+| B2b | RecursiveGPT K=4, no gate | 1.1167 | 1.0000 | 0.000 | 4.00 | 331 | 3× slower/step → fewer steps |
+| P2a | K=4, gate on, λ=0 | 1.1170 | 0.3242 | 0.000 | 1.97 | 325 | gate at floor (old definition) |
+| P2b | K=4, gate on, λ=1e-3 | 1.1147 | 0.1001 | 0.000 | 1.30 | 325 | λ>0 pushes to floor faster |
+| P2d | K=2, gate, var_reward=0.01 | 1.0561 | 0.1001 | 0.000 | 1.10 | 540 | K=2 wins on steps; var worked briefly |
+| P2e | K=2, gate, var_reward=0.05 | 1.0616 | 0.1001 | 0.000 | 1.10 | 541 | stronger var delayed collapse, slight penalty |
+| **P3a** | **K=2, RANDOM_K, no gate** | **1.0463** | 0.000 | 0.000 | 1.00 | **632** | **best recursive; RANDOM_K → more steps** |
+| P3b | K=2, RANDOM_K, LoRA=8 | TBD | — | — | — | ~600+ | running |
 
 ---
 
@@ -52,6 +57,39 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
   - Gradient checkpointing adds ~30% recompute overhead
   - B2b processes only 173M tokens (vs 477M for B1) in 5 minutes
 - **Implication**: in a fixed wall-clock budget, recursion is expensive. The architecture processes ~same FLOPs/step (both ~3.8B effective layer-token ops) but B2b has ~3× slower step time due to recompute.
+
+---
+
+## Phase 2b: K=2 Experiments (K=4 too slow for 5min budget)
+
+### P2d — K=2, gate_min=0.1, var_reward=0.01
+- **val_bpb: 1.056**, 540 steps, 31% MFU
+- gate_std showed 0.27-0.32 for early steps 6-80, then collapsed to 0.000
+- var_reward=0.01 briefly worked! But CE gradient overwhelmed it after ~80 steps
+- **Finding**: K=2 → 540 steps vs K=4 → 331 steps — 63% more optimizer steps → better val_bpb
+
+### P2e — K=2, gate_min=0.1, var_reward=0.05
+- **val_bpb: 1.062**, 541 steps, 31% MFU
+- gate_std ≈ 0.38-0.41 for steps 0-200, then collapsed to 0.000
+- Stronger var_reward delayed collapse but CE gradient still eventually wins
+- Slightly worse val_bpb than P2d because var_reward adds gradient noise
+
+---
+
+## Phase 3: Architecture Improvements
+
+### P3a — RANDOM_K=True, K=2, no gate, step_embeds random init
+- **val_bpb: 1.046** (new recursive best), 632 steps, 36% MFU
+- RANDOM_K randomly samples K ∈ {1, 2} each optimizer step
+  - K=1 steps: ~300ms; K=2 steps: ~570ms → average ~450ms vs 570ms fixed
+  - 632 steps vs 540 (K=2 fixed) — 17% more steps
+  - Higher MFU (36% vs 31%) due to mixed step lengths
+- **gate_mean=0, gate_std=0** (USE_GATE=False by design)
+- **Finding**: RANDOM_K gives more optimizer steps AND teaches model both K depths
+
+### P3b — RANDOM_K=True + LoRA rank=8 per step (RUNNING)
+- Adds K × (2H×8 + 8×H) = 25K params as per-step LoRA on inject
+- Hypothesis: LoRA makes each recurrence step truly distinct → K=2 beats K=1 more clearly for hard tokens
 
 ---
 
@@ -77,6 +115,22 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 3. **Gate collapse to floor**: k=1,2,3 gates immediately go to 0.1 (gate_min). This prevents meaningful per-token compute variation.
 
 ---
+
+## Seed Ideas (from user + analysis)
+
+1. **RANDOM_K training** (implemented P3a): sample K each step → model learns CE at all depths → natural basis for gate. Key finding: more steps + higher MFU → better val_bpb.
+
+2. **LoRA per step** (P3b): low-rank delta on inject per step → real step specialization. User: "somewhat independent of dynamic compute but may improve val_bpb at low compute addition"
+
+3. **Transformer knowing which recursion it's on** (partially done with step_embeds): changed init from zeros to randn*0.01 so model distinguishes steps from training start. User suggested this helps "better assess cost trade-off with recursions."
+
+4. **Min-one-recursion architecture**: k=0 is mandatory baseline, gate only controls k≥1. This is what the new `gate_mean` definition does (k=0 excluded from gate tracking). Trade-off: k=0 cost is "free" so model can always use at least one recurrence cheaply.
+
+5. **Token-level vs step-level compute**: RANDOM_K trains at different step-level K, but gate is token-level. Future: combine — RANDOM_K for training, gate for inference-time per-token adaptation.
+
+6. **Gate collapse root cause**: at init, inject(cat[e,s])=e (ignores s), so (u-s)≈0 for gated steps → CE gradient through gate ≈ 0 → lambda or noise dominates → instant floor collapse. Fix: LoRA makes (u-s) meaningful from step 0.
+
+7. **Val_bpb vs steps trade-off**: in 5-min budget, B1=924 steps→0.996, P3a=632 steps→1.046, B2b=331 steps→1.117. Strong linear relationship between steps and quality.
 
 ## Next Directions (Phase 2 continued)
 
