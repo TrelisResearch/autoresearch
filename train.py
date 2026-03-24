@@ -763,7 +763,7 @@ GATE_FROM_DIFF    = True   # True = gate from (u-s) update difference — token-
 GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE       = 0.0    # penalty on gate_mean; 0 = no penalty
 VAR_REWARD        = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-STEP_EMBED_SCALE  = 0.1    # step_embeds init scale; 0.1 → (u-s) ≈ 0.1-scale at init → gate has real signal
+STEP_EMBED_SCALE  = 0.02   # step_embeds init scale; P3k: 0.02 (0.1 caused NaN via gate_from_diff instability)
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
