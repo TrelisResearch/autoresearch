@@ -302,7 +302,7 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RecursiveGPT(nn.Module):
-    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False):
+    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False):
         super().__init__()
         self.config = config
         self.k_recurse = k_recurse
@@ -310,6 +310,7 @@ class RecursiveGPT(nn.Module):
         self.gate_min = gate_min
         self.lora_rank = lora_rank
         self.use_grad_ckpt = use_grad_ckpt
+        self.gate_from_prelude = gate_from_prelude
         n_embd = config.n_embd
         head_dim = n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -350,9 +351,12 @@ class RecursiveGPT(nn.Module):
         # Init: weight = [I | 0] so inject(cat[e,s]) ≈ e at t=0
         self.inject = nn.Linear(2 * n_embd, n_embd, bias=False)
 
-        # Gate: per-token scalar in [gate_min, 1], conditioned on proposed update u and state s
+        # Gate: per-token scalar in [gate_min, 1]
+        # gate_from_prelude=True: conditioned on prelude output e (bypasses (u-s)≈0 collapse)
+        # gate_from_prelude=False: conditioned on cat[u, s] (proposed update + state)
         # Bias init +2 → sigmoid(2)≈0.88 → gate≈0.89 (mostly open at start)
-        self.gate_proj = nn.Linear(2 * n_embd, 1, bias=True)
+        gate_in_dim = n_embd if gate_from_prelude else 2 * n_embd
+        self.gate_proj = nn.Linear(gate_in_dim, 1, bias=True)
 
         # Learned step embeddings — broadcast over (B, T) at each recurrence step
         # Critical: without these, shared weights see identical inputs every step
@@ -436,7 +440,7 @@ class RecursiveGPT(nn.Module):
                          list(self.transformer.rec.parameters()) +
                          list(self.transformer.cod.parameters()) +
                          [self.inject.weight])
-        # gate_proj: weight shape (1, 2H) — not suitable for orthogonalisation → AdamW
+        # gate_proj: weight shape (1, H) or (1, 2H) — 1-row matrix, not suitable for Muon → AdamW
         gate_params = list(self.gate_proj.parameters()) if self.use_gate else []
         # step_embeds and lora: scalar / small tensors → AdamW
         step_params = [self.step_embeds]
@@ -520,6 +524,12 @@ class RecursiveGPT(nn.Module):
         gate_sum = x.new_zeros(1)
         gate_sq_sum = x.new_zeros(1)
         n_gated = 0
+        # gate_from_prelude: compute per-token gate once from e before the loop
+        # This bypasses the (u-s)≈0 gradient collapse — e is well-defined from the prelude
+        g_prelude = None
+        if self.use_gate and self.gate_from_prelude and k_recurse > 1:
+            g_prelude = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                self.gate_proj(e))  # (B, T, 1) — same gate applied to all k≥1
         for k in range(k_recurse):
             # Fuse anchor + state, then inject step identity signal
             u = self.inject(torch.cat([e, s], dim=-1))
@@ -538,8 +548,11 @@ class RecursiveGPT(nn.Module):
                 # Full update — base recurrence, not included in gate_mean tracking
                 s = u
             else:
-                g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
-                    self.gate_proj(torch.cat([u, s], dim=-1)))
+                if self.gate_from_prelude:
+                    g = g_prelude  # computed once from e above
+                else:
+                    g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
+                        self.gate_proj(torch.cat([u, s], dim=-1)))
                 gate_sum = gate_sum + g.mean()
                 gate_sq_sum = gate_sq_sum + g.square().mean()
                 n_gated += 1
@@ -735,17 +748,18 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 # Recursive architecture
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
-USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
-GATE_MIN       = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
-LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD     = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-LORA_RANK      = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
-RANDOM_K       = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
+USE_GATE          = True   # True = learned gate; False = always full update (g=1, simple recursion)
+GATE_FROM_PRELUDE = True   # True = gate from prelude e (bypasses (u-s)≈0 collapse); False = gate from cat[u,s]
+GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
+LAMBDA_GATE       = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
+VAR_REWARD        = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
+RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3c-k2-randomK-gate"  # change per experiment
+RUN_NAME = "p3d-k2-randomK-gate-from-prelude"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -787,7 +801,7 @@ wandb.init(
     config=dict(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
         lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
-        lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT,
+        lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
         embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
@@ -799,7 +813,7 @@ wandb.init(
 
 with torch.device("meta"):
     if USE_RECURSIVE:
-        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT)
+        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE)
     else:
         model = GPT(config)
 model.to_empty(device=device)
