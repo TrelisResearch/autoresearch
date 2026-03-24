@@ -357,7 +357,9 @@ class RecursiveGPT(nn.Module):
         # Learned step embeddings — broadcast over (B, T) at each recurrence step
         # Critical: without these, shared weights see identical inputs every step
         # Init to zero so step 0 is pure prelude output; learned over training
-        self.step_embeds = nn.Parameter(torch.zeros(k_recurse, n_embd))
+        # Non-zero init: small random values so the model knows which step it's on from step 0
+        # (zero init meant all recurrences were indistinguishable early in training)
+        self.step_embeds = nn.Parameter(torch.randn(k_recurse, n_embd) * 0.01)
 
         # Optional per-step LoRA on inject (helps model distinguish recursion depth)
         if lora_rank > 0:
@@ -732,21 +734,20 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
-K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
-USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
+K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
+USE_GATE       = False  # True = learned gate; False = always full update (g=1, simple recursion)
 GATE_MIN       = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE    = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD     = 0.05   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
-                        # 0.01 → gate_std≈0.3 early then collapsed; 0.05 = 5× stronger nudge
-K_RECURSE      = 2      # use K=2 for faster steps (~500ms vs ~940ms), more optimizer steps in 5 min
+VAR_REWARD     = 0.0    # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
 LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
-RANDOM_K       = False  # if True: randomly sample K_eff in [1, K_RECURSE] each step during training
+RANDOM_K       = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
                         # model learns CE at all K depths → natural basis for per-token gate assignment
+                        # step_embeds init=randn*0.01 (not zeros) so model knows which step it's on
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p2e-k2-varreward0.05"  # change per experiment
+RUN_NAME = "p3a-k2-randomK-no-gate"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
