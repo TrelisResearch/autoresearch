@@ -510,7 +510,12 @@ class RecursiveGPT(nn.Module):
         s = e.clone()  # mutable recurrent state
 
         # --- Recurrence (K steps, shared recur blocks) ---
-        gate_total = x.new_zeros(1)
+        # k=0 is always a full update (baseline recurrence, not penalised).
+        # k=1..K-1 are gated: gate_mean/gate_std only track these steps.
+        # This way gate_mean=0 → 1 effective recurrence, gate_mean=1 → K recurrences.
+        gate_sum = x.new_zeros(1)
+        gate_sq_sum = x.new_zeros(1)
+        n_gated = 0
         for k in range(self.k_recurse):
             # Fuse anchor + state, then inject step identity signal
             u = self.inject(torch.cat([e, s], dim=-1))
@@ -524,22 +529,26 @@ class RecursiveGPT(nn.Module):
             else:
                 for j, block in enumerate(self.transformer.rec):
                     u = block(u, None, cos_sin, self.rec_ws[j])
-            # Gate or full update
-            if not self.use_gate:
-                # Simple recursion baseline: always full update
+            # k=0: always full update; k≥1: gate (if enabled)
+            if not self.use_gate or k == 0:
+                # Full update — base recurrence, not included in gate_mean tracking
                 s = u
-                gate_total = gate_total + x.new_ones(1)
-            elif k == 0:
-                # Step 0: forced full update (breaks chicken-and-egg for gated model)
-                s = u
-                gate_total = gate_total + x.new_ones(1)
             else:
                 g = self.gate_min + (1 - self.gate_min) * torch.sigmoid(
                     self.gate_proj(torch.cat([u, s], dim=-1)))
-                gate_total = gate_total + g.mean()
+                gate_sum = gate_sum + g.mean()
+                gate_sq_sum = gate_sq_sum + g.square().mean()
+                n_gated += 1
                 s = s + g * (u - s)
 
-        gate_mean = gate_total / self.k_recurse
+        # gate_mean over gated steps only (k=1..K-1); 0 if no gated steps
+        if n_gated > 0:
+            gate_mean = gate_sum / n_gated
+            gate_var = gate_sq_sum / n_gated - (gate_sum / n_gated) ** 2
+            gate_std = gate_var.clamp_min(0).sqrt()
+        else:
+            gate_mean = x.new_zeros(1)
+            gate_std = x.new_zeros(1)
 
         # --- Coda (run once) ---
         x = s
@@ -556,7 +565,7 @@ class RecursiveGPT(nn.Module):
         if targets is not None:
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                  ignore_index=-1, reduction=reduction)
-            return ce, gate_mean   # caller adds lambda * gate_mean to loss
+            return ce, gate_mean, gate_std   # caller adds lambda * gate_mean to loss
         return logits
 
 # ---------------------------------------------------------------------------
@@ -722,15 +731,15 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 # Recursive architecture
 USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
 K_RECURSE      = 4      # recurrence steps (effective depth = pre + rec*K + cod)
-USE_GATE       = False  # True = learned gate; False = always full update (g=1, simple recursion)
+USE_GATE       = True   # True = learned gate; False = always full update (g=1, simple recursion)
 GATE_MIN       = 0.1    # leaky gate floor — prevents dead g=0 absorbing state
-LAMBDA_GATE    = 0.0    # penalty on gate_mean (0=disabled; try 1e-3..5e-3 for gating)
+LAMBDA_GATE    = 1e-3   # penalty on gate_mean of gated steps (k≥1); sweep: 1e-4, 1e-3, 5e-3, 1e-2
 LORA_RANK      = 0      # per-step LoRA rank (0=disabled; try 8 to add step identity signal)
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "b2-recursive-k4-no-gate-bs128"  # change per experiment
+RUN_NAME = "p2b-gate-lambda1e-3"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -849,12 +858,14 @@ while True:
     torch.cuda.synchronize()
     t0 = time.time()
     gate_mean_accum = 0.0
+    gate_std_accum = 0.0
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             if USE_RECURSIVE:
-                ce, gate_mean_t = model(x, y)
+                ce, gate_mean_t, gate_std_t = model(x, y)
                 loss = ce + LAMBDA_GATE * gate_mean_t
                 gate_mean_accum += gate_mean_t.detach().item()
+                gate_std_accum += gate_std_t.detach().item()
             else:
                 loss = model(x, y)
         train_loss = loss.detach()
@@ -862,6 +873,7 @@ while True:
         loss.backward()
         x, y, epoch = next(train_loader)
     gate_mean_val = gate_mean_accum / grad_accum_steps if USE_RECURSIVE else 0.0
+    gate_std_val = gate_std_accum / grad_accum_steps if USE_RECURSIVE else 0.0
 
     # Progress and schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
@@ -899,7 +911,7 @@ while True:
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    gate_str = f" | gate: {gate_mean_val:.3f}" if USE_RECURSIVE else ""
+    gate_str = f" | gate_mean: {gate_mean_val:.3f} std: {gate_std_val:.3f}" if USE_RECURSIVE else ""
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}%{gate_str} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     if step % 10 == 0:
@@ -908,6 +920,7 @@ while True:
                     "train/step_ms": dt * 1000}
         if USE_RECURSIVE:
             log_dict["train/gate_mean"] = gate_mean_val
+            log_dict["train/gate_std"] = gate_std_val
         wandb.log(log_dict, step=step)
 
     # GC management (Python's GC causes ~500ms stalls)
@@ -932,10 +945,10 @@ total_tokens = step * TOTAL_BATCH_SIZE
 model.eval()
 with autocast_ctx:
     if USE_RECURSIVE:
-        # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean) tuple
+        # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean, gate_std) tuple
         class _CEOnlyModel:
             def __call__(self, x, y, reduction='mean'):
-                ce, _ = model(x, y, reduction=reduction)
+                ce, _, __ = model(x, y, reduction=reduction)
                 return ce
         val_bpb = evaluate_bpb(_CEOnlyModel(), tokenizer, DEVICE_BATCH_SIZE)
     else:
@@ -947,17 +960,17 @@ startup_time = t_start_training - t_start
 steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-# Compute final gate_mean from last eval pass if recursive
+# Compute final gate_mean/gate_std from eval pass if recursive
 final_gate_mean = 0.0
+final_gate_std = 0.0
 if USE_RECURSIVE:
-    # Re-run a small eval pass to get a stable gate_mean at eval time
     model.eval()
     with autocast_ctx, torch.no_grad():
-        # Grab one eval batch for gate measurement
         eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
         ex, ey, _ = next(eval_loader)
-        _, gm = model(ex.to(device), ey.to(device))
+        _, gm, gs = model(ex.to(device), ey.to(device))
         final_gate_mean = gm.item()
+        final_gate_std = gs.item()
     model.train()
 
 final_log = {
@@ -971,6 +984,7 @@ final_log = {
 }
 if USE_RECURSIVE:
     final_log["final/gate_mean"] = final_gate_mean
+    final_log["final/gate_std"] = final_gate_std
     final_log["final/effective_k"] = 1 + final_gate_mean * (K_RECURSE - 1)
 wandb.log(final_log)
 wandb.finish()
@@ -987,4 +1001,18 @@ print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {_depth}")
 if USE_RECURSIVE:
     print(f"gate_mean:        {final_gate_mean:.4f}")
+    print(f"gate_std:         {final_gate_std:.4f}")
     print(f"effective_k:      {1 + final_gate_mean * (K_RECURSE - 1):.2f}")
+
+# Auto-log to results.tsv
+import subprocess, csv, os as _os
+_commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                   cwd=_os.path.dirname(_os.path.abspath(__file__))).decode().strip()
+_eff_k  = 1 + final_gate_mean * (K_RECURSE - 1) if USE_RECURSIVE else 1.0
+_tsv_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "results.tsv")
+_header = "commit\tval_bpb\tgate_mean\tgate_std\teffective_k\tpeak_vram_mb\tstatus\tdescription\n"
+if not _os.path.exists(_tsv_path):
+    open(_tsv_path, "w").write(_header)
+with open(_tsv_path, "a") as _f:
+    _f.write(f"{_commit}\t{val_bpb:.6f}\t{final_gate_mean:.4f}\t{final_gate_std:.4f}\t{_eff_k:.2f}\t{peak_vram_mb:.1f}\tok\t{RUN_NAME}\n")
+print(f"Logged to results.tsv")
