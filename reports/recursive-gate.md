@@ -36,7 +36,9 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P2e | K=2, gate, var_reward=0.05 | 1.0616 | 0.1001 | 0.000 | 1.10 | 541 | stronger var delayed collapse, slight penalty |
 | **P3a** | **K=2, RANDOM_K, no gate** | **1.0463** | 0.000 | 0.000 | 1.00 | **632** | **best recursive; RANDOM_K → more steps** |
 | P3b | K=2, RANDOM_K, LoRA=8 | 1.6156 | 0.000 | 0.000 | 1.00 | ~600 | LoRA catastrophically hurt — see analysis |
-| P3c | K=2, RANDOM_K, gate on, λ=0 | TBD | — | — | — | ~600+ | running |
+| P3c | K=2, RANDOM_K, gate on, λ=0 | 1.0441 | 0.1001 | 0.000 | 1.10 | 630 | gate collapsed same as P2a — RANDOM_K helps steps but not gate |
+| **P3d** | **K=2, RANDOM_K, gate_from_prelude** | **1.0399** | 0.1001 | 0.000 | 1.10 | **641** | **new best; gate_std=0.16-0.39 early then collapsed** |
+| P3e | K=2, RANDOM_K, gate_from_prelude, var_reward=0.05 | TBD | — | — | — | ~640 | running |
 
 ---
 
@@ -99,9 +101,29 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
   - The model can't efficiently learn both the base inject weight AND per-step LoRA deltas under random K sampling
 - **Takeaway**: LoRA per-step and RANDOM_K are incompatible. Don't combine them.
 
-### P3c — RANDOM_K=True + gate on, no LoRA (RUNNING)
-- Hypothesis: RANDOM_K training exposes the model to both K=1 and K=2 → gate can learn which tokens benefit from K=2
-- Config: K=2, USE_GATE=True, LORA_RANK=0, RANDOM_K=True, LAMBDA_GATE=0.0, VAR_REWARD=0.0
+### P3c — RANDOM_K=True + gate on, no LoRA
+- **val_bpb: 1.044**, gate collapsed to floor (same as before)
+- RANDOM_K + gate: gate_std stays 0 throughout — RANDOM_K doesn't help the gate
+- When k_eff=1 is sampled (50% of steps), gate is not trained at all
+- When k_eff=2, same (u-s)≈0 collapse as before
+- **Takeaway**: RANDOM_K + gate gives same val_bpb as P3a (1.046). Gate doesn't add value here.
+
+### P3d — gate_from_prelude (KEY ARCHITECTURAL FIX)
+- **val_bpb: 1.040** (new recursive best), 641 steps, 36.8% MFU
+- gate_std: **0.163-0.388 in early steps** (breakthrough! first time gate showed real per-token variation)
+- **Why it works**: gate from e (prelude output), not cat[u,s]
+  - e is well-defined from prelude (2 transformer layers) → varies across tokens
+  - gradient ∂loss/∂gate_proj.weight ∝ e · (u-s) · g*(1-g)
+  - (u-s) ≈ step_embeds[k] ≠ 0 even at init (unlike cat[u,s] case)
+  - gate can learn token-level difficulty from contextual features
+- **Why it still collapsed**: gate_std high at steps 6-30, then drops to 0.01-0.07 by step 40, 0.0 by end
+  - CE gradient eventually dominates: model learns that k=1 doesn't improve CE → closes gate
+  - step_embeds contribution to (u-s) may shrink as model converges
+- **Takeaway**: gate_from_prelude is the right architecture. VAR_REWARD needed to sustain gate_std.
+
+### P3e — gate_from_prelude + VAR_REWARD=0.05 (RUNNING)
+- Hypothesis: gate_from_prelude gives real gradient signal; VAR_REWARD=0.05 rewards diversity to sustain gate_std > 0
+- Config: K=2, USE_GATE=True, GATE_FROM_PRELUDE=True, RANDOM_K=True, VAR_REWARD=0.05, LAMBDA_GATE=0.0
 
 ---
 
