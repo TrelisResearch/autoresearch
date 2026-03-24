@@ -753,8 +753,8 @@ K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod)
 USE_GATE          = True   # True = learned gate; False = always full update (g=1, simple recursion)
 GATE_FROM_PRELUDE = True   # True = gate from prelude e (bypasses (u-s)≈0 collapse); False = gate from cat[u,s]
 GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
-LAMBDA_GATE       = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD        = 0.05   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+LAMBDA_GATE       = -0.05  # penalty on gate_mean; negative = reward open gates, prevents floor collapse
+VAR_REWARD        = 0.01   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
 STEP_EMBED_SCALE  = 0.1    # step_embeds init scale; larger → bigger (u-s) → gate has more signal early
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
@@ -762,7 +762,7 @@ USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× act
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3i-k2-randomK-gfp-stepscale0.1"  # change per experiment
+RUN_NAME = "p3j-k2-randomK-gfp-lambda-0.05"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
