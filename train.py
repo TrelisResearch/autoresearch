@@ -361,9 +361,11 @@ class RecursiveGPT(nn.Module):
         # Learned step embeddings — broadcast over (B, T) at each recurrence step
         # Critical: without these, shared weights see identical inputs every step
         # Init to zero so step 0 is pure prelude output; learned over training
-        # Non-zero init: small random values so the model knows which step it's on from step 0
-        # (zero init meant all recurrences were indistinguishable early in training)
-        self.step_embeds = nn.Parameter(torch.randn(k_recurse, n_embd) * 0.01)
+        # Non-zero init: larger random values make each recurrence structurally distinct
+        # → (u-s) is meaningful from step 0 → gate has real gradient signal early
+        # step_embed_scale=0.01: tiny (u-s), gate gradient ∝ 0.01 → needs VAR_REWARD to keep alive
+        # step_embed_scale=0.1:  large (u-s), gate gradient 10× larger → may sustain gate without VAR_REWARD
+        self.step_embeds = nn.Parameter(torch.randn(k_recurse, n_embd) * STEP_EMBED_SCALE)
 
         # Optional per-step LoRA on inject (helps model distinguish recursion depth)
         if lora_rank > 0:
@@ -752,14 +754,15 @@ USE_GATE          = True   # True = learned gate; False = always full update (g=
 GATE_FROM_PRELUDE = True   # True = gate from prelude e (bypasses (u-s)≈0 collapse); False = gate from cat[u,s]
 GATE_MIN          = 0.1    # gate floor: 0.1 = leaky floor (prevents NaN from g=0 collapse)
 LAMBDA_GATE       = 0.0    # penalty on gate_mean of gated steps (k≥1); positive = close gates; negative = open gates
-VAR_REWARD        = 0.035  # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+VAR_REWARD        = 0.05   # reward gate variance across tokens: loss -= VAR_REWARD * Var(g)
+STEP_EMBED_SCALE  = 0.1    # step_embeds init scale; larger → bigger (u-s) → gate has more signal early
 LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
 RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-RUN_NAME = "p3h-k2-randomK-gfp-varreward0.035"  # change per experiment
+RUN_NAME = "p3i-k2-randomK-gfp-stepscale0.1"  # change per experiment
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -802,6 +805,7 @@ wandb.init(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN,
         lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
         lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
+        step_embed_scale=STEP_EMBED_SCALE,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
         embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
