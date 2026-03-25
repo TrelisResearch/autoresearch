@@ -158,6 +158,91 @@ def analyze_text(model, tokenizer, text, k_recurse=2, device="cpu"):
     for idx, g in hardest:
         print(f"    [{idx:3d}] g={g:.3f}  {repr(decoded[idx])}")
 
+    # Positional analysis: is gate correlated with position?
+    T = len(gate_vals)
+    thirds = T // 3
+    early_mean  = sum(gate_vals[:thirds]) / max(thirds, 1)
+    middle_mean = sum(gate_vals[thirds:2*thirds]) / max(thirds, 1)
+    late_mean   = sum(gate_vals[2*thirds:]) / max(T - 2*thirds, 1)
+    print(f"\n  Positional gate means:")
+    print(f"    early  (pos 0..{thirds-1}):    mean={early_mean:.3f}")
+    print(f"    middle (pos {thirds}..{2*thirds-1}): mean={middle_mean:.3f}")
+    print(f"    late   (pos {2*thirds}..{T-1}):  mean={late_mean:.3f}")
+    pos_var = max(early_mean, middle_mean, late_mean) - min(early_mean, middle_mean, late_mean)
+    if pos_var > 0.05:
+        print(f"    ** Positional bias detected (range={pos_var:.3f}) — gate varies by position")
+    else:
+        print(f"    Positional bias small (range={pos_var:.3f}) — gate tracks content, not position")
+
+
+def positional_analysis(model, tokenizer, device, n_batches=20, batch_size=4, seq_len=512):
+    """Run n_batches of val data and plot average gate value by sequence position.
+
+    If gate is purely positional, we'd see a monotonic curve.
+    If gate tracks content, the curve should be flat.
+    """
+    from prepare import make_dataloader
+    print(f"\n{'='*70}")
+    print("POSITIONAL ANALYSIS: avg gate value by sequence position")
+    print(f"Running {n_batches} batches (batch_size={batch_size}, seq_len={seq_len})")
+
+    val_loader = make_dataloader(tokenizer, batch_size, seq_len, "val")
+    pos_sums = [0.0] * seq_len
+    pos_counts = [0] * seq_len
+
+    model.eval()
+    with torch.no_grad():
+        for _ in range(n_batches):
+            x, y, _ = next(val_loader)
+            x, y = x.to(device), y.to(device)
+            _, _, _, _, g_prelude = model(x, y, reduction='none', return_gate_values=True)
+            if g_prelude is None:
+                print("No gate values available.")
+                return
+            # g_prelude: (B, T, 1) → (B, T)
+            g = g_prelude[:, :, 0].cpu().float()  # (B, T)
+            for t in range(g.shape[1]):
+                pos_sums[t] += g[:, t].sum().item()
+                pos_counts[t] += g.shape[0]
+
+    # Print ASCII bar chart of gate by position (bucketed into 32 bins)
+    n_bins = 32
+    bin_size = seq_len // n_bins
+    bin_means = []
+    for b in range(n_bins):
+        s = sum(pos_sums[b*bin_size:(b+1)*bin_size])
+        c = sum(pos_counts[b*bin_size:(b+1)*bin_size])
+        bin_means.append(s / c if c > 0 else 0.0)
+
+    gate_min = min(bin_means)
+    gate_max = max(bin_means)
+    gate_range = gate_max - gate_min
+    print(f"\n  Gate by position (each col = {bin_size} tokens, min={gate_min:.3f}, max={gate_max:.3f}, range={gate_range:.3f})")
+    print()
+
+    bar_height = 8
+    for row in range(bar_height, 0, -1):
+        threshold = gate_min + (row / bar_height) * gate_range
+        line = "  "
+        for bm in bin_means:
+            line += "█" if bm >= threshold else " "
+        line += f"  {gate_min + (row/bar_height)*gate_range:.3f}"
+        print(line)
+    print("  " + "─" * n_bins)
+    print(f"  start{' '*int(n_bins/2-5)}end")
+
+    if gate_range > 0.02:
+        # Find if it's monotonically increasing/decreasing or peaked
+        first_half  = sum(bin_means[:n_bins//2]) / (n_bins//2)
+        second_half = sum(bin_means[n_bins//2:]) / (n_bins//2)
+        if abs(first_half - second_half) > 0.01:
+            direction = "higher at start" if first_half > second_half else "higher at end"
+            print(f"\n  ** Positional gradient detected ({direction}): first_half={first_half:.3f}, second_half={second_half:.3f}")
+        else:
+            print(f"\n  Fluctuating pattern (no clear start/end trend) — gate likely tracks local content")
+    else:
+        print(f"\n  Gate is FLAT across positions (range={gate_range:.4f}) — gate tracks content type, not position")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -180,6 +265,9 @@ def main():
         analyze_text(model, tokenizer, text, k_recurse=k_recurse, device=device)
     print(f"\n{'='*70}")
     print("Done. Green=easy (skipped), Red=hard (kept).")
+
+    # Bulk positional analysis over validation data
+    positional_analysis(model, tokenizer, device)
 
 
 if __name__ == "__main__":
