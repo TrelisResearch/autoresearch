@@ -70,6 +70,7 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P4o | Standard GPT 80-min | _queued_ | — | — | — | — | Iso-compute reference for P4n |
 | P4p | K=2 gate VAR=0.2 20-min | _queued_ | — | — | — | — | Sweet spot between VAR=0.1 (4% hard, unstable) and VAR=0.3 (52% hard) |
 | P4q | K=2 gate VAR=0.3 + LAMBDA=0.15, 20-min | _queued_ | — | — | — | — | Analytic target: skip_rate=1/2+L/(2V)=0.75; stable VAR=0.3 + mean penalty |
+| P4r | K=2 gate VAR=0.3 + LAMBDA=0.15, 80-min | _planned_ | — | — | — | — | Long-run gated model: does gating help quality/FLOP at 80-min? Compare to P4n |
 
 ---
 
