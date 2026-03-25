@@ -444,7 +444,7 @@ class RecursiveGPT(nn.Module):
         self.cos, self.sin = self._precompute_rope(self.rotary_seq_len, head_dim)
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, lora_lr=0.004):
         n_embd = self.config.n_embd
         dmodel_lr_scale = (n_embd / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({n_embd}/768) = {dmodel_lr_scale:.6f}")
@@ -472,7 +472,8 @@ class RecursiveGPT(nn.Module):
         if gate_params:
             param_groups.append(dict(kind='adamw', params=gate_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         if lora_params:
-            param_groups.append(dict(kind='adamw', params=lora_params, lr=scalar_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            # LoRA LR passed explicitly via lora_lr arg; P4e=0.004 (too low), P4f=0.02 (middle ground)
+            param_groups.append(dict(kind='adamw', params=lora_params, lr=lora_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         for shape in sorted({p.shape for p in matrix_params}):
             grp = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=grp, lr=matrix_lr,
@@ -774,25 +775,26 @@ DEPTH = 8               # number of transformer layers (ignored when USE_RECURSI
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
-USE_RECURSIVE  = True   # True = RecursiveGPT, False = standard GPT
+USE_RECURSIVE  = True
 K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
-USE_GATE          = True   # True = learned gate; False = always full update (g=1, simple recursion)
+USE_GATE          = False  # P4d: no gate — pure LoRA step-specialization test
 GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
 GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
 GATE_MIN          = 0.1    # standard floor
 GATE_MIN_INIT     = 0.1    # no curriculum
 LAMBDA_GATE       = 0.0    # no penalty
-VAR_REWARD        = 0.0    # P4a: no VAR_REWARD — test if 20min training sustains gate naturally
-STEP_EMBED_SCALE  = 0.1    # larger step_embeds → bigger (u-s) → stronger gate gradient
-INJECT_INIT       = "symmetric"  # symmetric inject for strong early gate gradient signal
-LORA_RANK         = 0      # per-step LoRA rank (0=disabled); P3b showed LoRA+RANDOM_K is catastrophic
-RANDOM_K          = True   # randomly sample K_eff in [1, K_RECURSE] each step during training
+VAR_REWARD        = 0.0
+STEP_EMBED_SCALE  = 0.1
+INJECT_INIT       = "identity"  # same as P3a baseline for clean comparison
+LORA_RANK         = 8     # fixed K=2: both adapters always train, rank=8 gives more capacity
+LORA_LR           = 0.02  # P4f: try higher LoRA LR (P4e used 0.004=unembedding_lr, too low for step specialization)
+RANDOM_K          = False  # fixed K=2 so step-1 LoRA always gets gradient on every step
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-TIME_BUDGET = 1200  # 20-minute run: 4× longer than standard — test if gate opens naturally without VAR_REWARD
-RUN_NAME = "p4a-20min-no-var"  # long run: hypothesis gates stay open with enough training signal
+TIME_BUDGET = _BASE_TIME_BUDGET  # 5-min standard
+RUN_NAME = "p4f-lora8-lr0.02"  # LoRA rank=8, fixed K=2, higher LR 0.02 — can step specialization beat P3a (1.046)?
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -834,7 +836,7 @@ wandb.init(
     config=dict(
         use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN, gate_min_init=GATE_MIN_INIT, inject_init=INJECT_INIT,
         lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
-        lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
+        lora_rank=LORA_RANK, lora_lr=LORA_LR, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
         gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
         depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
         window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
@@ -865,7 +867,7 @@ tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-optimizer = model.setup_optimizer(
+_opt_kwargs = dict(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
@@ -873,6 +875,9 @@ optimizer = model.setup_optimizer(
     matrix_lr=MATRIX_LR,
     weight_decay=WEIGHT_DECAY,
 )
+if USE_RECURSIVE and LORA_RANK > 0:
+    _opt_kwargs['lora_lr'] = LORA_LR
+optimizer = model.setup_optimizer(**_opt_kwargs)
 
 model = torch.compile(model, dynamic=False)
 
