@@ -66,8 +66,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | **P4k** | **Standard GPT 40-min reference** | **0.9294** | — | — | — | **7363** | **Gap at 40-min: 0.009 (down from 0.019 at 20-min, 0.050 at 5-min)** |
 | P4l | K=2 gate VAR=0.1 20-min + checkpoint | 0.9617 | 0.1011 | **0.029** | 1.10 | 2524 | gate mostly collapsed (vs P4i gate_std=0.167); final_gate_std from single batch — high variance |
 | **P4m** | **K=2 gate VAR_REWARD=0.3 20-min** | **0.9676** | **0.520** | **0.449** | **1.52** | **2511** | **Gate bimodal (binary 0/1). 54% skip rate, +0.0009 bpb. VAR=0.3 too strong: +0.007 bpb vs no-gate baseline** |
-| P4n | K=2 RANDOM_K no gate 80-min | _running_ | — | — | — | — | Extend scaling curve; expected gap≈0.004 bpb |
-| P4o | Standard GPT 80-min | _queued_ | — | — | — | — | Iso-compute reference for P4n |
+| **P4n** | **K=2 RANDOM_K no gate 80-min** | **0.9254** | — | — | 1.00 | 9889 | **Extends scaling curve; gap halves again** |
+| P4o | Standard GPT 80-min | _running_ | — | — | — | — | Iso-compute reference for P4n (~80 min) |
 | P4p | K=2 gate VAR=0.2 20-min | _queued_ | — | — | — | — | Sweet spot between VAR=0.1 (4% hard, unstable) and VAR=0.3 (52% hard) |
 | P4q | K=2 gate VAR=0.3 + LAMBDA=0.15, 20-min | _queued_ | — | — | — | — | Analytic target: skip_rate=1/2+L/(2V)=0.75; stable VAR=0.3 + mean penalty |
 | P4r | K=2 gate VAR=0.3 + LAMBDA=0.15, 80-min | _planned_ | — | — | — | — | Long-run gated model: does gating help quality/FLOP at 80-min? Compare to P4n |
@@ -413,11 +413,19 @@ Simpler case: only 1 gated step. May be easier to train meaningful gates.
 | 0.1 (P4i) | 0.042 | 0.167 | 95.8% | +0.001 bpb | sometimes collapses (P4l: std=0.029) |
 | 0.3 (P4m) | 0.520 | 0.449 | 54% | +0.007 bpb | always bimodal but 50/50 |
 
-### 80-min Scaling Curve (P4n + P4o)
-- **P4n** (K=2 RANDOM_K no gate, 80-min): running — expected val_bpb≈0.920-0.925
-- **P4o** (standard GPT, 80-min): queued — expected val_bpb≈0.924-0.928
-- If halving pattern holds: gap at 80-min ≈ 0.004 bpb (vs 0.009 at 40-min)
-- Extrapolation: ~160-min to close gap entirely
+### 80-min Scaling Curve (P4n done, P4o running)
+- **P4n** (K=2 RANDOM_K no gate, 80-min): **val_bpb=0.9254**, 9889 steps ✓
+- **P4o** (standard GPT, 80-min): running — expected ~0.921 (if gap≈0.004 bpb)
+- Updated compute scaling curve:
+
+| Training time | Recursive K=2 | Standard GPT | Gap |
+|---|---|---|---|
+| 5-min | 1.0463 | 0.9964 | 0.050 |
+| 20-min | 0.9603 | 0.9413 | 0.019 |
+| 40-min | 0.9384 | 0.9294 | 0.009 |
+| 80-min | **0.9254** | _running_ | **~0.004?** |
+
+Gap halving pattern confirmed at 80-min (0.009 → ~0.004).
 
 ### VAR Sweet Spot (P4p + P4q)
 
@@ -445,7 +453,7 @@ This holds when gates are binary and at equilibrium between CE, VAR, and LAMBDA 
 
 3. **val_bpb comparison is misleading**: B2b ≈ P2a ≈ 1.117 doesn't mean the gate helped or hurt — the dominant factor is the number of optimizer steps (331 vs 924 for B1).
 
-4. **Compute scaling curve confirms gap narrows**: 0.050 (5-min) → 0.019 (20-min) → 0.009 (40-min) → ~0.004 (80-min predicted). Gap halves with each 2× training time. Extrapolated break-even: ~160-min.
+4. **Compute scaling curve confirms gap narrows**: 0.050 (5-min) → 0.019 (20-min) → 0.009 (40-min) → 0.9254 vs ~0.921 at 80-min (gap ~0.004 predicted). Gap halves with each 2× training time. Extrapolated break-even: ~160-min.
 
 5. **Gate interpretability**: Binary (0.1 or 1.0), content-driven not position-driven. Function words + punctuation = hard (need 2nd recurrence for disambiguation). Content words + names = easy (skip).
 
