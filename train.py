@@ -517,7 +517,7 @@ class RecursiveGPT(nn.Module):
             u = block(u, None, cos_sin, self.rec_ws[j])
         return u
 
-    def forward(self, idx, targets=None, reduction='mean', k_override=None, gate_threshold=0.0):
+    def forward(self, idx, targets=None, reduction='mean', k_override=None, gate_threshold=0.0, return_gate_values=False):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         k_recurse = k_override if k_override is not None else self.k_recurse
@@ -611,6 +611,8 @@ class RecursiveGPT(nn.Module):
         if targets is not None:
             ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                  ignore_index=-1, reduction=reduction)
+            if return_gate_values:
+                return ce, gate_mean, gate_std, skip_frac, g_prelude
             return ce, gate_mean, gate_std, skip_frac   # caller adds lambda * gate_mean to loss
         return logits
 
@@ -775,26 +777,26 @@ DEPTH = 8               # number of transformer layers (ignored when USE_RECURSI
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
-USE_RECURSIVE  = False  # P4k: standard GPT reference at 40-min to complete scaling curve
-K_RECURSE      = 2      # P4k: standard GPT 40-min reference
-USE_GATE          = False  # no gate — clean scaling curve
-GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
-GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
+USE_RECURSIVE  = True   # P4l: gated recursive — checkpoint + eval_gates.py to verify hard-token hypothesis
+K_RECURSE      = 2      # K=2: same as P4i
+USE_GATE          = True   # gate enabled — VAR_REWARD forces bimodal distribution
+GATE_FROM_PRELUDE = True   # gate from prelude e (avoids dead gradient collapse)
+GATE_FROM_DIFF    = False
 GATE_MIN          = 0.1    # standard floor
 GATE_MIN_INIT     = 0.1    # no curriculum
-LAMBDA_GATE       = 0.0    # no penalty
-VAR_REWARD        = 0.0    # no VAR reward — clean baseline
+LAMBDA_GATE       = 0.0    # no sparsity penalty — let VAR_REWARD drive gate diversity
+VAR_REWARD        = 0.1    # P4i sweet spot: gate_std=0.167, 95.8% skip at τ=0.2
 STEP_EMBED_SCALE  = 0.1
 INJECT_INIT       = "identity"
 LORA_RANK         = 0      # no LoRA
-LORA_LR           = 0.004  # unused (LORA_RANK=0)
-RANDOM_K          = True   # K=2 RANDOM_K for more steps
-USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
+LORA_LR           = 0.004
+RANDOM_K          = True   # more optimizer steps via variable K
+USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-TIME_BUDGET = _BASE_TIME_BUDGET * 8  # 40-min: extend compute scaling to test if recursive matches standard GPT
-RUN_NAME = "p4k-standard-40min"  # standard GPT 40-min: iso-compute reference to compare vs recursive K=2 40-min (P4j)
+TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: match P4i duration for clean comparison
+RUN_NAME = "p4l-gated-checkpoint"  # P4l: gated K=2 VAR=0.1 20-min + checkpoint for eval_gates.py
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1127,15 @@ if USE_RECURSIVE and not USE_GATE and K_RECURSE > 1:
         _ksweep_log[f"ksweep/k{_k}_eff_depth"] = _eff_depth
     print(f"  ref: P3a K=2 RANDOM_K val_bpb=1.046300, B1 standard GPT (8 layers) val_bpb=0.996400")
     wandb.log(_ksweep_log)
+
+# ---------------------------------------------------------------------------
+# Checkpoint save (only for gated recursive runs — needed for eval_gates.py)
+# ---------------------------------------------------------------------------
+if USE_RECURSIVE and USE_GATE:
+    _ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"checkpoint_{RUN_NAME}.pt")
+    _orig_mod = getattr(model, '_orig_mod', model)
+    torch.save(_orig_mod.state_dict(), _ckpt_path)
+    print(f"Saved checkpoint to {_ckpt_path}")
 
 wandb.finish()
 
