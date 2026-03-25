@@ -54,4 +54,11 @@ if wait_for_run "/workspace/run_p4r.log" "P4r"; then
     ssh_cmd "test -f /workspace/autoresearch/checkpoint_p4r-gate-80min.pt && \
         cd /workspace/autoresearch && WANDB_API_KEY=$WANDB nohup uv run python -u eval_gates.py \
         checkpoint_p4r-gate-80min.pt > /workspace/eval_gates_p4r.log 2>&1 &" 2>/dev/null || true
+
+    # Auto-launch P4s → P4t pipeline
+    echo ""
+    echo "=== Auto-launching P4s → P4t pipeline ==="
+    scp -P "$PORT" -i "$KEY" "$(dirname "$0")/deploy_p4s_p4t.sh" "$REMOTE:/workspace/deploy_p4s_p4t.sh" 2>/dev/null || true
+    ssh_cmd "chmod +x /workspace/deploy_p4s_p4t.sh && nohup bash /workspace/deploy_p4s_p4t.sh > /workspace/deploy_p4s_p4t.out 2>&1 &" || true
+    echo "[$(date)] deploy_p4s_p4t.sh launched."
 fi
