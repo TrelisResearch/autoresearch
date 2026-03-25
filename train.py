@@ -776,26 +776,25 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    USE_RECURSIVE  = True   # P4n: K=2 RANDOM_K no gate, 80-min — extend compute scaling curve
-    K_RECURSE      = 2      # K=2 (same as P4a/P4j)
-    USE_GATE          = False  # no gate — clean scaling curve
+    USE_RECURSIVE  = False  # P4o: standard GPT 80-min — complete scaling curve at 80-min
+    K_RECURSE      = 2
+    USE_GATE          = False
     GATE_FROM_PRELUDE = True
     GATE_FROM_DIFF    = False
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
     LAMBDA_GATE       = 0.0
-    VAR_REWARD        = 0.0    # no VAR reward — no gate
+    VAR_REWARD        = 0.0
     STEP_EMBED_SCALE  = 0.1
     INJECT_INIT       = "identity"
     LORA_RANK         = 0
     LORA_LR           = 0.004
-    RANDOM_K          = True   # K=2 RANDOM_K for more steps
+    RANDOM_K          = True
     USE_GRAD_CKPT  = True
-    # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: next point on compute scaling curve
-    RUN_NAME = "p4n-recursive-80min"  # P4n: K=2 RANDOM_K 80-min; extrapolated gap≈0.004 (vs 0.009 at 40-min)
+    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: iso-compute reference for P4n
+    RUN_NAME = "p4o-standard-80min"  # P4o: standard GPT 80-min iso-compute reference
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
