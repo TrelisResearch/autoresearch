@@ -775,8 +775,8 @@ DEPTH = 8               # number of transformer layers (ignored when USE_RECURSI
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
-USE_RECURSIVE  = True
-K_RECURSE      = 2      # P4j: K=2, 40-min — extend compute scaling curve: does recursive catch standard GPT?
+USE_RECURSIVE  = False  # P4k: standard GPT reference at 40-min to complete scaling curve
+K_RECURSE      = 2      # P4k: standard GPT 40-min reference
 USE_GATE          = False  # no gate — clean scaling curve
 GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
 GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
@@ -794,7 +794,7 @@ USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× act
 
 # Experiment tracking
 TIME_BUDGET = _BASE_TIME_BUDGET * 8  # 40-min: extend compute scaling to test if recursive matches standard GPT
-RUN_NAME = "p4j-k2-40min"  # K=2, RANDOM_K, 40-min: complete scaling curve — does recursive gap vs standard GPT close?
+RUN_NAME = "p4k-standard-40min"  # standard GPT 40-min: iso-compute reference to compare vs recursive K=2 40-min (P4j)
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
