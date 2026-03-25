@@ -78,6 +78,7 @@ def load_model(ckpt_path):
     )
     model.load_state_dict(sd)
     model.eval()
+    model.bfloat16()  # FA3 requires bf16/fp16 inputs
     return model, k_recurse
 
 SAMPLE_TEXTS = [
@@ -102,7 +103,8 @@ def analyze_text(model, tokenizer, text, k_recurse=2, device="cpu"):
     y = torch.full_like(x, -1)
     y[0, :-1] = x[0, 1:]
 
-    with torch.no_grad():
+    autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if device != 'cpu' else torch.amp.autocast(device_type='cpu', dtype=torch.bfloat16)
+    with torch.no_grad(), autocast_ctx:
         ce, gate_mean, gate_std, skip_frac, g_prelude = model(
             x, y, reduction='none', return_gate_values=True)
 
@@ -187,8 +189,9 @@ def positional_analysis(model, tokenizer, device, n_batches=20, batch_size=4, se
     pos_sums = [0.0] * seq_len
     pos_counts = [0] * seq_len
 
+    autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx:
         for _ in range(n_batches):
             x, y, _ = next(val_loader)
             x, y = x.to(device), y.to(device)
