@@ -776,14 +776,14 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
 USE_RECURSIVE  = True
-K_RECURSE      = 2      # P4i: K=2 — user's Q: can small VAR_REWARD sustain gate at 20-min without 0.007 quality cost?
-USE_GATE          = True   # gate on — test sustained gate over 20 min
+K_RECURSE      = 2      # P4j: K=2, 40-min — extend compute scaling curve: does recursive catch standard GPT?
+USE_GATE          = False  # no gate — clean scaling curve
 GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
 GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
 GATE_MIN          = 0.1    # standard floor
 GATE_MIN_INIT     = 0.1    # no curriculum
 LAMBDA_GATE       = 0.0    # no penalty
-VAR_REWARD        = 0.1    # small VAR_REWARD: sustain gate with minimal quality penalty (0.05 gave gate_std=0.029)
+VAR_REWARD        = 0.0    # no VAR reward — clean baseline
 STEP_EMBED_SCALE  = 0.1
 INJECT_INIT       = "identity"
 LORA_RANK         = 0      # no LoRA
@@ -793,8 +793,8 @@ USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× act
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min
-RUN_NAME = "p4i-k2-gate-var0.1-20min"  # 20-min, K=2, VAR_REWARD=0.1: does small variance reward sustain gate at 20-min?
+TIME_BUDGET = _BASE_TIME_BUDGET * 8  # 40-min: extend compute scaling to test if recursive matches standard GPT
+RUN_NAME = "p4j-k2-40min"  # K=2, RANDOM_K, 40-min: complete scaling curve — does recursive gap vs standard GPT close?
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
