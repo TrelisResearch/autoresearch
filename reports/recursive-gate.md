@@ -69,6 +69,7 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P4n | K=2 RANDOM_K no gate 80-min | _running_ | — | — | — | — | Extend scaling curve; expected gap≈0.004 bpb |
 | P4o | Standard GPT 80-min | _queued_ | — | — | — | — | Iso-compute reference for P4n |
 | P4p | K=2 gate VAR=0.2 20-min | _queued_ | — | — | — | — | Sweet spot between VAR=0.1 (4% hard, unstable) and VAR=0.3 (52% hard) |
+| P4q | K=2 gate VAR=0.3 + LAMBDA=0.15, 20-min | _queued_ | — | — | — | — | Analytic target: skip_rate=1/2+L/(2V)=0.75; stable VAR=0.3 + mean penalty |
 
 ---
 
@@ -417,10 +418,21 @@ Simpler case: only 1 gated step. May be easier to train meaningful gates.
 - If halving pattern holds: gap at 80-min ≈ 0.004 bpb (vs 0.009 at 40-min)
 - Extrapolation: ~160-min to close gap entirely
 
-### VAR Sweet Spot (P4p)
-- **P4p** (VAR=0.2, K=2, 20-min): queued — targeting ~20-30% hard tokens (skip rate 70-80%)
-- Hypothesis: VAR=0.2 is between 0.1 (4% hard) and 0.3 (52% hard) on a roughly linear scale
-- If P4p skip rate is ~75%: good trade-off with lower quality cost than VAR=0.3
+### VAR Sweet Spot (P4p + P4q)
+
+**Analytical framework** for binary gate equilibrium:
+```
+skip_rate = 1/2 + LAMBDA_GATE / (2 * VAR_REWARD)
+p_hard = 1 - skip_rate = (1 - LAMBDA_GATE/VAR_REWARD) / 2
+```
+This holds when gates are binary and at equilibrium between CE, VAR, and LAMBDA gradients.
+
+- **P4p** (VAR=0.2, LAMBDA=0): queued — targeting ~20-30% hard tokens
+  - Formula: p_hard = 0.5 (50/50), but CE gradient + lower VAR may push lower
+  - Will tell us: where does VAR=0.2 land in the 0.1 (4% hard) to 0.3 (52% hard) spectrum?
+- **P4q** (VAR=0.3, LAMBDA=0.15): queued — analytically targets 25% hard (75% skip)
+  - Formula: p_hard = (1 - 0.15/0.3)/2 = 0.25 ← directly computed
+  - If formula holds: should give 75% skip, better than P4m's 54%
 
 ---
 
