@@ -254,7 +254,7 @@ def main():
     model = model.to(device)
     print(f"Model loaded: K={k_recurse}, gate_from_prelude=True\n")
 
-    tokenizer = Tokenizer()
+    tokenizer = Tokenizer.from_directory()
 
     for i, text in enumerate(SAMPLE_TEXTS):
         print(f"{'='*70}")
