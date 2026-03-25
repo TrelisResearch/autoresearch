@@ -776,15 +776,17 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    USE_RECURSIVE  = True   # P4p: K=2 gated, VAR=0.2 — find sweet spot between 0.1 (4% hard, unstable) and 0.3 (52% hard)
+    # P4q: analytically-targeted skip rate: skip_rate = 1/2 + LAMBDA_GATE/(2*VAR_REWARD)
+    # At equilibrium for binary gates: VAR=0.3 + LAMBDA_GATE=0.15 → p_hard = (1 - 0.15/0.3)/2 = 0.25 (75% skip)
+    USE_RECURSIVE  = True
     K_RECURSE      = 2
     USE_GATE          = True
     GATE_FROM_PRELUDE = True
     GATE_FROM_DIFF    = False
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
-    LAMBDA_GATE       = 0.0
-    VAR_REWARD        = 0.2   # middle of 0.1 (sometimes collapses) and 0.3 (stable but 52% hard); target ~20-30% hard tokens
+    LAMBDA_GATE       = 0.15  # analytical target: 75% skip rate with VAR=0.3 (formula: p_hard=(1-L/V)/2=(1-0.5)/2=0.25)
+    VAR_REWARD        = 0.3   # stable bimodal (proven in P4m); LAMBDA_GATE shifts equilibrium from 50/50 to 25/75
     STEP_EMBED_SCALE  = 0.1
     INJECT_INIT       = "identity"
     LORA_RANK         = 0
@@ -793,8 +795,8 @@ if __name__ == "__main__":
     USE_GRAD_CKPT  = True
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: gate sweet spot search (same duration as P4i/P4m)
-    RUN_NAME = "p4p-var0.2-gate"  # P4p: VAR=0.2 gate; sweet spot between VAR=0.1 (unstable 4% hard) and VAR=0.3 (stable 52% hard)
+    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: gate sweet spot search (same duration as P4i/P4m/P4p)
+    RUN_NAME = "p4q-var0.3-lambda0.15"  # P4q: analytically target 75% skip; VAR=0.3 (stable) + LAMBDA=0.15 → p_hard≈0.25
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
