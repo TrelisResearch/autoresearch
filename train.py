@@ -776,25 +776,25 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
 USE_RECURSIVE  = True
-K_RECURSE      = 4      # P4g: K=4 — train at multiple depths, sweep K=1,2,3,4 at inference (Phase 3)
-USE_GATE          = False  # no gate — clean ablation: does more recurrence help?
+K_RECURSE      = 2      # P4i: K=2 — user's Q: can small VAR_REWARD sustain gate at 20-min without 0.007 quality cost?
+USE_GATE          = True   # gate on — test sustained gate over 20 min
 GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
 GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
 GATE_MIN          = 0.1    # standard floor
 GATE_MIN_INIT     = 0.1    # no curriculum
 LAMBDA_GATE       = 0.0    # no penalty
-VAR_REWARD        = 0.0
+VAR_REWARD        = 0.1    # small VAR_REWARD: sustain gate with minimal quality penalty (0.05 gave gate_std=0.029)
 STEP_EMBED_SCALE  = 0.1
 INJECT_INIT       = "identity"
-LORA_RANK         = 0      # no LoRA — clean test
+LORA_RANK         = 0      # no LoRA
 LORA_LR           = 0.004  # unused (LORA_RANK=0)
-RANDOM_K          = True   # sample K∈{1,2,3,4} each step — more optimizer steps than fixed K=4
+RANDOM_K          = True   # K=2 RANDOM_K for more steps
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: test if K=4 beats K=2 at longer training (P4a was K=2 20-min: 0.960)
-RUN_NAME = "p4h-k4-randomk-20min"  # K=4 RANDOM_K, 20-min: does K=4 beat K=2 at longer training? K-sweep shows tradeoff
+TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min
+RUN_NAME = "p4i-k2-gate-var0.1-20min"  # 20-min, K=2, VAR_REWARD=0.1: does small variance reward sustain gate at 20-min?
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
