@@ -313,6 +313,7 @@ class RecursiveGPT(nn.Module):
         self.use_grad_ckpt = use_grad_ckpt
         self.gate_from_prelude = gate_from_prelude
         self.gate_from_diff = gate_from_diff
+        self._inject_init = inject_init
         n_embd = config.n_embd
         head_dim = n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -421,10 +422,10 @@ class RecursiveGPT(nn.Module):
                     torch.nn.init.zeros_(block.attn.ve_gate.weight)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
-        # Inject init: controlled by INJECT_INIT global
+        # Inject init: controlled by self._inject_init
         # "identity": [I | 0] — inject ignores s at init; slow to learn s-dependence → k=1≈k=0
         # "symmetric": [0.5*I | 0.5*I] — inject blends e+s equally → k=1 refines based on k=0 output
-        if inject_init == "symmetric":
+        if self._inject_init == "symmetric":
             self.inject.weight.data[:, :n_embd] = 0.5 * torch.eye(n_embd)
             self.inject.weight.data[:, n_embd:] = 0.5 * torch.eye(n_embd)
         else:
