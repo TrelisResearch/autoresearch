@@ -79,6 +79,10 @@ if wait_for_run "/workspace/run_p4p.log" "P4p"; then
     P4P_GATE_MEAN=$(ssh_cmd "grep 'final_gate_mean:' /workspace/run_p4p.log | tail -1 | awk '{print \$2}'" 2>/dev/null || echo "N/A")
     P4P_GATE_STD=$(ssh_cmd "grep 'final_gate_std:' /workspace/run_p4p.log | tail -1 | awk '{print \$2}'" 2>/dev/null || echo "N/A")
     echo "P4p val_bpb=$P4P_BPB  gate_mean=$P4P_GATE_MEAN  gate_std=$P4P_GATE_STD"
+    # Run eval_gates on P4p checkpoint if it exists
+    ssh_cmd "test -f /workspace/autoresearch/checkpoint_p4p-var0.2-gate.pt && \
+        WANDB_API_KEY=$WANDB nohup uv run python -u /workspace/autoresearch/eval_gates.py \
+        /workspace/autoresearch/checkpoint_p4p-var0.2-gate.pt > /workspace/eval_gates_p4p.log 2>&1 &" 2>/dev/null || true
 fi
 
 # Step 6: Deploy P4q (VAR=0.3 + LAMBDA=0.15, target 75% skip) — commit e974e95
@@ -95,6 +99,10 @@ if wait_for_run "/workspace/run_p4q.log" "P4q"; then
     P4Q_GATE_MEAN=$(ssh_cmd "grep 'final_gate_mean:' /workspace/run_p4q.log | tail -1 | awk '{print \$2}'" 2>/dev/null || echo "N/A")
     P4Q_GATE_STD=$(ssh_cmd "grep 'final_gate_std:' /workspace/run_p4q.log | tail -1 | awk '{print \$2}'" 2>/dev/null || echo "N/A")
     echo "P4q val_bpb=$P4Q_BPB  gate_mean=$P4Q_GATE_MEAN  gate_std=$P4Q_GATE_STD"
+    # Run eval_gates on P4q checkpoint if it exists
+    ssh_cmd "test -f /workspace/autoresearch/checkpoint_p4q-var0.3-lambda0.15.pt && \
+        WANDB_API_KEY=$WANDB nohup uv run python -u /workspace/autoresearch/eval_gates.py \
+        /workspace/autoresearch/checkpoint_p4q-var0.3-lambda0.15.pt > /workspace/eval_gates_p4q.log 2>&1 &" 2>/dev/null || true
 fi
 
 echo ""
