@@ -796,8 +796,8 @@ if __name__ == "__main__":
     USE_GRAD_CKPT  = True
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: K=4 gate ablation (compare to P4q K=2 gate)
-    RUN_NAME = "p4s-k4-gate"  # P4s: K=4 gated; effective_k≈1.75 at inference (vs 1.25 for K=2)
+    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: K=4 gated long-run (P4t)
+    RUN_NAME = "p4t-k4-gate-80min"  # P4t: K=4 gated 80-min; does K=4+gate beat K=2+gate (P4r) at same wall-clock?
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
