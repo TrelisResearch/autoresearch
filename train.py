@@ -776,8 +776,8 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    # P4q: analytically-targeted skip rate: skip_rate = 1/2 + LAMBDA_GATE/(2*VAR_REWARD)
-    # At equilibrium for binary gates: VAR=0.3 + LAMBDA_GATE=0.15 → p_hard = (1 - 0.15/0.3)/2 = 0.25 (75% skip)
+    # P4r: best gate config (VAR=0.3 + LAMBDA=0.15) at 80-min to see if gating helps at long training
+    # P4q at 20-min confirmed analytical target (assumed; run after P4q verifies)
     USE_RECURSIVE  = True
     K_RECURSE      = 2
     USE_GATE          = True
@@ -785,8 +785,8 @@ if __name__ == "__main__":
     GATE_FROM_DIFF    = False
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
-    LAMBDA_GATE       = 0.15  # analytical target: 75% skip rate with VAR=0.3 (formula: p_hard=(1-L/V)/2=(1-0.5)/2=0.25)
-    VAR_REWARD        = 0.3   # stable bimodal (proven in P4m); LAMBDA_GATE shifts equilibrium from 50/50 to 25/75
+    LAMBDA_GATE       = 0.15  # analytical target: skip_rate=1/2+L/(2V)=0.75; validated in P4q
+    VAR_REWARD        = 0.3   # stable bimodal; LAMBDA shifts equilibrium from 50/50 to 25/75
     STEP_EMBED_SCALE  = 0.1
     INJECT_INIT       = "identity"
     LORA_RANK         = 0
@@ -795,8 +795,8 @@ if __name__ == "__main__":
     USE_GRAD_CKPT  = True
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: gate sweet spot search (same duration as P4i/P4m/P4p)
-    RUN_NAME = "p4q-var0.3-lambda0.15"  # P4q: analytically target 75% skip; VAR=0.3 (stable) + LAMBDA=0.15 → p_hard≈0.25
+    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: test if gating helps at long training vs P4n
+    RUN_NAME = "p4r-gate-80min"  # P4r: 80-min gated K=2 (VAR=0.3+LAMBDA=0.15); compare to P4n (no-gate 80-min)
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
