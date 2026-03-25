@@ -318,5 +318,164 @@ def k_sweep_analysis(model, tokenizer, device, k_recurse):
         print(f"  Best gated:  {min(b for _, b in gated):.4f} ({min(gated, key=lambda x: x[1])[0]})")
 
 
+def prefill_vs_decode_analysis(model, tokenizer, device):
+    """Compare gate values for 'prefill' (prompt) vs 'decode' (generated) positions.
+
+    In autoregressive inference, prefill processes the prompt and decode generates
+    new tokens. The user's intuition: prefill positions may require more recurrence
+    than decode positions (prompt establishes hard context; continuation flows naturally).
+
+    Method: take prompt+continuation pairs, run full sequence through model, compare
+    gate distributions for prompt positions vs continuation positions.
+    """
+    PROMPTS = [
+        # (prompt, continuation) — prompt is 'prefill', continuation is 'decode'
+        (
+            "The transformer architecture uses self-attention to",
+            " process sequences in parallel. Each attention head learns different relationships between tokens. The feedforward layers then apply nonlinear transformations."
+        ),
+        (
+            "def merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])",
+            "\n    return merge(left, right)\n\ndef merge(a, b):\n    result = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            result.append(a[i]); i += 1\n        else:\n            result.append(b[j]); j += 1"
+        ),
+        (
+            "In 1969, Neil Armstrong became the first human to walk on the Moon. The Apollo 11 mission launched on July 16 and",
+            " landed in the Sea of Tranquility on July 20. Armstrong's famous words were 'one small step for man, one giant leap for mankind'. The crew returned safely on July 24."
+        ),
+        (
+            "The mitochondria are the powerhouse of the cell. They produce ATP through oxidative phosphorylation. The inner membrane contains",
+            " cristae that increase surface area for ATP synthase. The electron transport chain pumps protons across the membrane, creating a gradient that drives ATP production."
+        ),
+        (
+            "x = 5\ny = 10\nz = x + y\nprint(f'Sum: {z}')\n\nfor i in range(10):\n",
+            "    if i % 2 == 0:\n        print(f'{i} is even')\n    else:\n        print(f'{i} is odd')\n\nresult = [i**2 for i in range(20) if i % 3 == 0]"
+        ),
+    ]
+
+    print(f"\n{'='*70}")
+    print("PREFILL vs DECODE ANALYSIS")
+    print("Do prompt (prefill) positions use more recurrence than continuation (decode) positions?")
+    print(f"{'='*70}")
+
+    autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if device != 'cpu' else torch.amp.autocast(device_type='cpu', dtype=torch.bfloat16)
+
+    all_prefill_gates = []
+    all_decode_gates = []
+
+    for prompt, continuation in PROMPTS:
+        full_text = prompt + continuation
+        prompt_tokens = tokenizer.encode(prompt)
+        full_tokens = tokenizer.encode(full_text)
+        n_prompt = len(prompt_tokens)
+
+        if len(full_tokens) > MAX_SEQ_LEN - 1:
+            full_tokens = full_tokens[:MAX_SEQ_LEN - 1]
+
+        x = torch.tensor([full_tokens], dtype=torch.long, device=device)
+        y = torch.full_like(x, -1)
+        y[0, :-1] = x[0, 1:]
+
+        with torch.no_grad(), autocast_ctx:
+            _, _, _, _, g_prelude = model(x, y, reduction='none', return_gate_values=True)
+
+        if g_prelude is None:
+            print("  [no gate values — model not gated]")
+            return
+
+        gate_vals = g_prelude[0, :, 0].cpu().float().tolist()
+        n_seq = len(gate_vals)
+        n_decode_start = min(n_prompt, n_seq)
+
+        prefill_gates = gate_vals[:n_decode_start]
+        decode_gates = gate_vals[n_decode_start:]
+
+        if not prefill_gates or not decode_gates:
+            continue
+
+        pmean = sum(prefill_gates) / len(prefill_gates)
+        dmean = sum(decode_gates) / len(decode_gates)
+        phigh = sum(g > 0.5 for g in prefill_gates) / len(prefill_gates)
+        dhigh = sum(g > 0.5 for g in decode_gates) / len(decode_gates)
+
+        all_prefill_gates.extend(prefill_gates)
+        all_decode_gates.extend(decode_gates)
+
+        print(f"\n  Prompt: {repr(prompt[:50])}...")
+        print(f"    Prefill ({n_decode_start} tokens):     mean={pmean:.3f}  hard_frac={phigh:.1%}")
+        print(f"    Decode  ({len(decode_gates)} tokens): mean={dmean:.3f}  hard_frac={dhigh:.1%}")
+        print(f"    Delta (prefill - decode): {pmean - dmean:+.3f}")
+
+        # Visual comparison: first 60 gate values as bars
+        bar_prefill = "".join("█" if g > 0.5 else "░" for g in gate_vals[:min(60, n_decode_start)])
+        bar_decode = "".join("█" if g > 0.5 else "░" for g in gate_vals[n_decode_start:n_decode_start+min(60, len(decode_gates))])
+        print(f"    Prefill gates: |{bar_prefill}|")
+        print(f"    Decode  gates: |{bar_decode}|")
+
+    if all_prefill_gates and all_decode_gates:
+        pmean_all = sum(all_prefill_gates) / len(all_prefill_gates)
+        dmean_all = sum(all_decode_gates) / len(all_decode_gates)
+        phigh_all = sum(g > 0.5 for g in all_prefill_gates) / len(all_prefill_gates)
+        dhigh_all = sum(g > 0.5 for g in all_decode_gates) / len(all_decode_gates)
+        delta = pmean_all - dmean_all
+
+        print(f"\n{'='*70}")
+        print(f"AGGREGATE ({len(all_prefill_gates)} prefill, {len(all_decode_gates)} decode tokens):")
+        print(f"  Prefill mean gate: {pmean_all:.4f}  hard_frac={phigh_all:.1%}")
+        print(f"  Decode  mean gate: {dmean_all:.4f}  hard_frac={dhigh_all:.1%}")
+        print(f"  Delta (prefill - decode): {delta:+.4f}")
+
+        if abs(delta) < 0.01:
+            print(f"\n  FINDING: Gate is similar in prefill and decode positions (Δ={delta:+.4f})")
+            print(f"  Interpretation: Recursion need is content-driven, not context-position-driven.")
+            print(f"  Both prompts and continuations have similar proportions of hard/easy tokens.")
+        elif delta > 0.01:
+            print(f"\n  FINDING: Prefill uses MORE recursion than decode (Δ={delta:+.4f})")
+            print(f"  Interpretation: Prompt tokens are harder — they establish ambiguous context.")
+            print(f"  Generated tokens flow more naturally (more predictable given context).")
+        else:
+            print(f"\n  FINDING: Decode uses MORE recursion than prefill (Δ={delta:+.4f})")
+            print(f"  Interpretation: Generated tokens are harder — exploring novel continuations.")
+
+        # Information-theoretic interpretation
+        print(f"\n  INFORMATION-THEORETIC NOTE:")
+        print(f"  Gate ≈ uncertainty proxy. High gate → token has high conditional entropy")
+        print(f"  (many plausible continuations). Low gate → token nearly deterministic given context.")
+        print(f"  Hard tokens (g≈1.0) have high H(x_t | context) and benefit from extra compute.")
+        print(f"  Easy tokens (g≈0.1) are low-entropy: their representation is settled after 1 pass.")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: uv run eval_gates.py checkpoint_p4l-gated-checkpoint.pt")
+        sys.exit(1)
+    ckpt_path = sys.argv[1]
+    print(f"Loading checkpoint: {ckpt_path}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+
+    model, k_recurse = load_model(ckpt_path)
+    model = model.to(device)
+    print(f"Model loaded: K={k_recurse}, gate_from_prelude=True\n")
+
+    tokenizer = Tokenizer.from_directory()
+
+    for i, text in enumerate(SAMPLE_TEXTS):
+        print(f"{'='*70}")
+        print(f"Sample {i+1}: {text[:60]}{'...' if len(text)>60 else ''}")
+        analyze_text(model, tokenizer, text, k_recurse=k_recurse, device=device)
+    print(f"\n{'='*70}")
+    print("Done. Green=easy (skipped), Red=hard (kept).")
+
+    # Bulk positional analysis over validation data
+    positional_analysis(model, tokenizer, device)
+
+    # Prefill vs decode: does prompt context use more recursion than generated continuation?
+    prefill_vs_decode_analysis(model, tokenizer, device)
+
+    # K-sweep: measure val_bpb at K=1, K=2, and gate-controlled (various thresholds)
+    if torch.cuda.is_available():  # requires GPU for evaluate_bpb (uses CUDA token_bytes)
+        k_sweep_analysis(model, tokenizer, device, k_recurse)
+
+
 if __name__ == "__main__":
     main()
