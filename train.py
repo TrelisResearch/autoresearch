@@ -303,7 +303,7 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RecursiveGPT(nn.Module):
-    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False, gate_from_diff=False, step_embed_scale=0.1, inject_init="identity"):
+    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False, gate_from_diff=False, gate_from_postlude0=False, step_embed_scale=0.1, inject_init="identity"):
         super().__init__()
         self.config = config
         self.k_recurse = k_recurse
@@ -313,6 +313,7 @@ class RecursiveGPT(nn.Module):
         self.use_grad_ckpt = use_grad_ckpt
         self.gate_from_prelude = gate_from_prelude
         self.gate_from_diff = gate_from_diff
+        self.gate_from_postlude0 = gate_from_postlude0
         self._inject_init = inject_init
         n_embd = config.n_embd
         head_dim = n_embd // config.n_head
@@ -357,9 +358,11 @@ class RecursiveGPT(nn.Module):
         # Gate: per-token scalar in [gate_min, 1]
         # gate_from_prelude=True: conditioned on prelude output e (bypasses (u-s)≈0 collapse)
         # gate_from_diff=True: conditioned on (u-s) = update difference — token-specific, non-zero when step_embeds≠0
+        # gate_from_postlude0=True: conditioned on cat[e, s_k0] where s_k0 is the state after k=0 pass
+        #   Richer signal: gate sees HOW MUCH k=0 changed the token (large change → likely needs more passes)
         # else: conditioned on cat[u, s] (proposed update + state)
         # Bias init +2 → sigmoid(2)≈0.88 → gate≈0.89 (mostly open at start)
-        gate_in_dim = n_embd if (gate_from_prelude or gate_from_diff) else 2 * n_embd
+        gate_in_dim = n_embd if (gate_from_prelude or gate_from_diff) else 2 * n_embd  # postlude0 uses 2*n_embd (cat[e,s_k0])
         self.gate_proj = nn.Linear(gate_in_dim, 1, bias=True)
         # _gate_min_t: tensor buffer for gate floor — use in-place .fill_() to update without triggering
         # torch.compile recompilation (changing a Python float self.gate_min would recompile every step)
@@ -564,8 +567,13 @@ class RecursiveGPT(nn.Module):
             if not self.use_gate or k == 0:
                 # Full update — base recurrence, not included in gate_mean tracking
                 s = u
+                # gate_from_postlude0: compute gate AFTER k=0 from cat[e, s_k0]
+                # Richer signal than gate_from_prelude: gate sees how much k=0 changed the token
+                if self.use_gate and self.gate_from_postlude0 and k == 0 and k_recurse > 1:
+                    g_prelude = gmin + (1 - gmin) * torch.sigmoid(
+                        self.gate_proj(torch.cat([e, s], dim=-1)))  # (B, T, 1)
             else:
-                if self.gate_from_prelude:
+                if self.gate_from_prelude or self.gate_from_postlude0:
                     # Apply hard threshold at inference: tokens with g < threshold skip recurrence
                     g = g_prelude if gate_threshold <= 0.0 else torch.where(
                         g_prelude >= gate_threshold, g_prelude, torch.zeros_like(g_prelude))
@@ -776,14 +784,15 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    # P4s: K=4 gated (VAR=0.3+LAMBDA=0.15) at 20-min
-    # K=4 with same gate target: effective K at inference = 1 + 0.25*3 = 1.75 (vs 1.25 for K=2)
-    # More potential compute savings; K=4 trained quality may help too (P4h: K=4→0.970 at 20-min)
+    # P4u: K=2 gate_from_postlude0 (20-min ablation)
+    # Gate sees how much k=0 changed the token → richer signal than gate_from_prelude
+    # Hypothesis: tokens that barely change after first recurrence need no second pass
     USE_RECURSIVE  = True
-    K_RECURSE      = 4
+    K_RECURSE      = 2
     USE_GATE          = True
-    GATE_FROM_PRELUDE = True
+    GATE_FROM_PRELUDE = False
     GATE_FROM_DIFF    = False
+    GATE_FROM_POSTLUDE0 = True  # NEW: compute gate from cat[e, s_after_k0]
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
     LAMBDA_GATE       = 0.15  # analytical target: skip_rate≈0.75 with VAR=0.3 (formula validated in P4q)
@@ -796,8 +805,8 @@ if __name__ == "__main__":
     USE_GRAD_CKPT  = True
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: K=4 gated long-run (P4t)
-    RUN_NAME = "p4t-k4-gate-80min"  # P4t: K=4 gated 80-min; does K=4+gate beat K=2+gate (P4r) at same wall-clock?
+    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: K=2 gate_from_postlude0 ablation (P4u)
+    RUN_NAME = "p4u-k2-postlude0-gate"  # P4u: gate sees first recurrence output vs prelude only
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
@@ -840,7 +849,7 @@ if __name__ == "__main__":
             use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN, gate_min_init=GATE_MIN_INIT, inject_init=INJECT_INIT,
             lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
             lora_rank=LORA_RANK, lora_lr=LORA_LR, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
-            gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
+            gate_from_diff=GATE_FROM_DIFF, gate_from_postlude0=GATE_FROM_POSTLUDE0, step_embed_scale=STEP_EMBED_SCALE,
             depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
             window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
             embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
@@ -852,7 +861,7 @@ if __name__ == "__main__":
 
     with torch.device("meta"):
         if USE_RECURSIVE:
-            model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE, gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE, inject_init=INJECT_INIT)
+            model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE, gate_from_diff=GATE_FROM_DIFF, gate_from_postlude0=GATE_FROM_POSTLUDE0, step_embed_scale=STEP_EMBED_SCALE, inject_init=INJECT_INIT)
         else:
             model = GPT(config)
     model.to_empty(device=device)
