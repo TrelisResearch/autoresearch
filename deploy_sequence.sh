@@ -37,7 +37,7 @@ deploy_run() {
     local log="$2"
     local run_name="$3"
     echo "[$(date)] Deploying $run_name (commit $commit)..."
-    ssh_cmd "cd /workspace/autoresearch && git fetch origin && git checkout $commit -- train.py"
+    ssh_cmd "cd /workspace/autoresearch && git fetch trelis && git checkout $commit -- train.py && git checkout trelis/recursive-gate -- eval_gates.py"
     ssh_cmd "WANDB_API_KEY=$WANDB nohup uv run python -u /workspace/autoresearch/train.py > $log 2>&1 &"
     echo "[$(date)] $run_name launched, logging to $log"
 }
