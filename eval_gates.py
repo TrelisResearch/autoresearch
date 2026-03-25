@@ -274,6 +274,99 @@ def main():
         k_sweep_analysis(model, tokenizer, device, k_recurse)
 
 
+def gate_loss_correlation(model, tokenizer, device, n_batches=20, batch_size=4, seq_len=512):
+    """Directly measure correlation between gate value and per-token CE loss.
+
+    If gate ≈ conditional entropy proxy, high-gate tokens should have higher loss
+    (they're harder to predict). Compute Pearson r(gate, loss) and report loss
+    bucketed by gate value.
+    """
+    from prepare import make_dataloader
+    print(f"\n{'='*70}")
+    print("GATE vs TOKEN LOSS CORRELATION")
+    print(f"Testing: do high-gate tokens have higher per-token CE loss?")
+    print(f"Running {n_batches} batches (batch_size={batch_size}, seq_len={seq_len})")
+
+    val_loader = make_dataloader(tokenizer, batch_size, seq_len, "val")
+
+    autocast_ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) if device != 'cpu' else torch.amp.autocast(device_type='cpu', dtype=torch.bfloat16)
+    model.eval()
+
+    all_gates = []
+    all_losses = []
+
+    with torch.no_grad(), autocast_ctx:
+        for _ in range(n_batches):
+            x, y, _ = next(val_loader)
+            x, y = x.to(device), y.to(device)
+            ce_tokens, gate_mean, gate_std, skip_frac, g_prelude = model(
+                x, y, reduction='none', return_gate_values=True)
+            if g_prelude is None:
+                print("  No gate values available.")
+                return
+            # ce_tokens: (B*T,) flat — need to align with gate values
+            # g_prelude: (B, T, 1)
+            # y: (B, T) — -1 for padding
+            valid_mask = y.view(-1) != -1
+            # gate is (B, T, 1) → (B*T,)
+            gate_flat = g_prelude[:, :, 0].reshape(-1)
+            # ce_tokens is flat but may include -1 padding positions
+            # Only keep valid (non-padding) positions
+            # Note: reduction='none' CE still has padding at -1 → 0 loss
+            gate_valid = gate_flat[valid_mask].cpu().float()
+            loss_valid = ce_tokens.view(-1)[valid_mask].cpu().float()
+            all_gates.append(gate_valid)
+            all_losses.append(loss_valid)
+
+    all_gates = torch.cat(all_gates)   # (N,)
+    all_losses = torch.cat(all_losses)  # (N,)
+
+    # Pearson correlation
+    g_mean = all_gates.mean()
+    l_mean = all_losses.mean()
+    cov = ((all_gates - g_mean) * (all_losses - l_mean)).mean()
+    g_std = all_gates.std()
+    l_std = all_losses.std()
+    pearson_r = (cov / (g_std * l_std + 1e-8)).item()
+
+    print(f"\n  N={len(all_gates):,} token pairs")
+    print(f"  gate range: [{all_gates.min():.3f}, {all_gates.max():.3f}]  mean={all_gates.mean():.3f}")
+    print(f"  loss range: [{all_losses.min():.3f}, {all_losses.max():.3f}]  mean={all_losses.mean():.3f}")
+    print(f"\n  Pearson r(gate, loss) = {pearson_r:.4f}")
+
+    if pearson_r > 0.2:
+        print(f"  ** STRONG POSITIVE CORRELATION: high-gate tokens have higher loss")
+        print(f"     Gate IS a conditional entropy proxy (confirms information-theoretic interpretation)")
+    elif pearson_r > 0.05:
+        print(f"  ** WEAK POSITIVE CORRELATION: gate partially tracks token difficulty")
+    elif pearson_r > -0.05:
+        print(f"  No significant correlation: gate and loss are approximately independent")
+    else:
+        print(f"  Negative correlation: high-gate tokens tend to be easier (unexpected)")
+
+    # Bucket analysis: loss by gate decile
+    n_buckets = 5
+    g_min, g_max = all_gates.min().item(), all_gates.max().item()
+    g_range = g_max - g_min
+    if g_range < 0.01:
+        print(f"\n  Gate range too small for bucket analysis (gates are uniform)")
+        return
+
+    print(f"\n  Loss by gate bucket:")
+    for b in range(n_buckets):
+        lo = g_min + b * g_range / n_buckets
+        hi = g_min + (b + 1) * g_range / n_buckets
+        mask = (all_gates >= lo) & (all_gates < hi)
+        if b == n_buckets - 1:
+            mask = all_gates >= lo
+        if mask.sum() == 0:
+            continue
+        bucket_loss = all_losses[mask].mean().item()
+        bucket_n = mask.sum().item()
+        bar = "█" * int(bucket_loss * 5)
+        print(f"    gate [{lo:.2f},{hi:.2f}): n={bucket_n:6,}  loss={bucket_loss:.4f}  {bar}")
+
+
 def k_sweep_analysis(model, tokenizer, device, k_recurse):
     """Measure val_bpb at K=1, K=2, and various gate thresholds.
 
@@ -471,6 +564,9 @@ def main():
 
     # Prefill vs decode: does prompt context use more recursion than generated continuation?
     prefill_vs_decode_analysis(model, tokenizer, device)
+
+    # Gate vs token loss correlation: does gate track per-token uncertainty?
+    gate_loss_correlation(model, tokenizer, device)
 
     # K-sweep: measure val_bpb at K=1, K=2, and gate-controlled (various thresholds)
     if torch.cuda.is_available():  # requires GPU for evaluate_bpb (uses CUDA token_bytes)
