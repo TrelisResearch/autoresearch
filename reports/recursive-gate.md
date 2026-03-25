@@ -60,6 +60,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P4e | K=2 RANDOM_K, LoRA rank=4, LR=0.004 (fixed) | 1.0470 | — | — | 1.00 | ~632 | LR fix works; LoRA neutral vs P3a |
 | P4f | K=2 fixed, LoRA rank=8, LR=0.02 | 1.0789 | — | — | 1.00 | ~535 | LR spike at step 138 hurt; 0.02 still too high |
 | **P4g** | **K=4 RANDOM_K, no gate — Phase 3 K-sweep** | **1.0797** | — | — | — | **468** | **K-sweep: K=1→1.089, K=2→1.082, K=3→1.080, K=4→1.080** |
+| **P4h** | **K=4 RANDOM_K, 20-min — K-sweep at 20-min quality** | **0.9701** | — | — | — | **1820** | **K-sweep K=1→0.987, K=4→0.970. K-benefit grows with training (0.009→0.017)** |
+| P4i | K=2 RANDOM_K, gate, VAR_REWARD=0.1, 20-min | TBD | TBD | TBD | TBD | ~2400 | running: does small VAR_REWARD sustain gate over 20-min? |
 
 ---
 
@@ -230,6 +232,25 @@ When gate < τ: token skips second recurrence (g set to 0 → s unchanged). Meas
 - At even longer training, recursive model may close the gap further
 
 **Key insight**: The recursive architecture benefits more from each additional token than standard GPT — the shared weights can keep improving as training progresses because the same weights are applied multiple times per forward pass. The step-count disadvantage (~32% fewer steps) is the dominant factor, but it matters less over longer training.
+
+### P4h — 20-min K=4 RANDOM_K with K-sweep
+- **val_bpb at K=4 inference: 0.9701**, 1820 steps, 954M tokens, MFU: 34.4%
+- Compare vs P4a (K=2, 20-min): 0.9603 — K=4 is still 0.010 worse at 20-min (fewer steps: 1820 vs 2521)
+
+**Inference K-sweep at 20-min training level:**
+
+| K | Eff. depth | val_bpb |
+|---|---|---|
+| 1 | 8 | 0.9865 |
+| 2 | 12 | 0.9729 |
+| 3 | 16 | 0.9705 |
+| 4 | 20 | 0.9701 |
+
+**Key findings:**
+1. **K-benefit grows with training time**: at 5-min the K benefit was 0.009 bpb; at 20-min it's 0.017 bpb. The more the shared weights are trained, the more value each extra recurrence provides.
+2. **K=1 (0.987) beats 5-min standard GPT (0.996)** at 20-min training — even the cheapest inference option from the K=4 model outperforms a freshly trained 5-min standard GPT!
+3. **K=4 gap from K=2 persists**: 0.970 vs 0.960. The step-count penalty (28% fewer steps) still dominates at 20 min.
+4. **Hypothesis**: at 40-60 min training, K=4 should match or beat K=2 because the K-benefit curve is steeper than the step-count penalty curve.
 
 ---
 
