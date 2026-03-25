@@ -71,7 +71,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P4p | K=2 gate VAR=0.2 20-min | _queued_ | — | — | — | — | Sweet spot between VAR=0.1 (4% hard, unstable) and VAR=0.3 (52% hard) |
 | P4q | K=2 gate VAR=0.3 + LAMBDA=0.15, 20-min | _queued_ | — | — | — | — | Analytic target: skip_rate=1/2+L/(2V)=0.75; stable VAR=0.3 + mean penalty |
 | P4r | K=2 gate VAR=0.3 + LAMBDA=0.15, 80-min | _planned_ | — | — | — | — | Long-run gated model: does gating help quality/FLOP at 80-min? Compare to P4n |
-| P4s | K=4 gate VAR=0.3 + LAMBDA=0.15, 20-min | _planned_ | — | — | — | — | K=4 gate ablation: effective K=1.75 at inference (vs 1.25 for K=2), may have better quality |
+| P4s | K=4 gate VAR=0.3 + LAMBDA=0.15, 20-min | _queued_ | — | — | — | — | K=4 gate ablation: effective K=1.75 at inference (vs 1.25 for K=2), may have better quality |
+| P4t | K=4 gate VAR=0.3 + LAMBDA=0.15, 80-min | _planned_ | — | — | — | — | Long-run K=4 gate: does K=4 gate beat K=2 gate (P4r) at same wall-clock? |
 
 ---
 
@@ -396,6 +397,25 @@ Simpler case: only 1 gated step. May be easier to train meaningful gates.
 - **Quality cost**: +0.0072 bpb vs P4a baseline (0.9604→0.9676) — heavier than P4i (+0.001 bpb)
 - **Interpretation**: higher VAR pushes toward 50/50 (maximum variance); not the target skip rate
 
+**P4m K-sweep (eval_gates.py v2 on checkpoint):**
+
+| Config | val_bpb | Δ vs K=2 | Notes |
+|---|---|---|---|
+| K=1 (fixed) | 0.9712 | +0.0035 | cheapest inference |
+| K=2 (fixed) | 0.9677 | — | trained val_bpb |
+| gate(τ=0.2) | 0.9685 | +0.0008 | 54% skip, 1.46× eff_k |
+| gate(τ=0.3) | 0.9685 | +0.0008 | same (binary gates: all thresholds equal) |
+| gate(τ=0.5) | 0.9685 | +0.0008 | same |
+| gate(τ=0.7) | 0.9685 | +0.0008 | same |
+
+**Key finding**: 54% skip rate (VAR=0.3 no LAMBDA) costs only **+0.0008 bpb** vs fixed K=2 while running at effective K=1.46. This is far cheaper than the K=1→K=2 gap (0.0035 bpb). P4q (75% skip target) should cost even less.
+
+**Prefill vs decode analysis (P4m checkpoint)**:
+- Prefill (187 tokens): gate_mean=0.543, hard_frac=49.2%
+- Decode (292 tokens): gate_mean=0.575, hard_frac=52.7%, delta=−0.032
+- **Finding**: Decode positions use slightly MORE recursion than prefill (opposite of initial intuition)
+- Domain-dependent: code continuations (e.g., merge body after merge_sort setup) are harder; prose continuations slightly easier than prompt. Gate tracks per-token content, not prompt/continuation position.
+
 ### Gate Interpretability: eval_gates.py on P4m checkpoint
 - **Binary gates confirmed**: gate values are strictly 0.100 or 1.000 — no gradients, bimodal
 - **High-gate tokens (hard, need 2nd recurrence)**: punctuation, function words, operators (`.`, `+`, `of`, `;`)
@@ -476,11 +496,26 @@ The gate is thus **adaptive compute allocation based on per-token uncertainty**.
 
 Method: Take 5 prompt+continuation pairs across code, prose, and science domains. Run the full sequence through the model; compare gate values for prompt positions vs continuation positions.
 
-**Results pending** — will run on P4q and P4r checkpoints when available. The function is in place and will be auto-executed by `eval_gates.py`.
+**Results on P4m checkpoint** (`eval_gates_p4m_v2.log`):
 
-**Prior evidence (positional_analysis)**: Gate is flat across positions (range=0.066 over 20 val batches). This suggests position per se doesn't drive gating decisions. However, this doesn't directly test the prefill/decode hypothesis — prompt content vs generated content may differ systematically in entropy even if absolute position doesn't matter.
+| Segment | Tokens | gate_mean | hard_frac (g>0.5) |
+|---|---|---|---|
+| Prefill (prompt) | 187 | 0.5428 | 49.2% |
+| Decode (continuation) | 292 | 0.5747 | 52.7% |
+| Delta | — | **−0.032** | **−3.5pp** |
 
-**Expected finding**: If prefill typically contains denser semantic content (code keyword-rich prompts, rare names in sentences) vs decode (which may generate more predictable continuations), then prefill positions may show slightly higher average gate values. But if the model truly gates on per-token entropy, the difference will be small — a well-constructed continuation has equally hard tokens as the prompt.
+**Finding: Decode positions use MORE recursion than prefill (opposite of initial intuition).**
+
+Per-example breakdown:
+- Prose ("transformer architecture…"): Δ=+0.009 — prefill slightly harder
+- Code (merge_sort → merge): Δ=−0.096 — decode much harder (complex logic in continuation)
+- History ("Neil Armstrong…"): Δ=+0.012 — prefill slightly harder (rare names/dates)
+- Science ("mitochondria…"): Δ=+0.016 — prefill slightly harder (technical vocab)
+- Code ("x=5; for loop → list comp"): Δ=−0.004 — essentially equal
+
+**Interpretation**: The split is domain-dependent. In code, continuations can be more complex than the context (merge_sort setup vs merge implementation). In factual prose, prompts anchor harder concepts (names, dates). The aggregate decode>prefill result is driven by code examples where continuations have dense operator/logic sequences.
+
+**This does NOT support the "prefill = more compute" hypothesis.** The gate truly tracks per-token content difficulty, not prompt-vs-continuation position.
 
 ### Analytical Framework: Gate as Conditional Entropy Proxy
 
