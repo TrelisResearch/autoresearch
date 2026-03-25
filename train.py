@@ -776,8 +776,8 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # Recursive architecture
 USE_RECURSIVE  = True
-K_RECURSE      = 2      # recurrence steps (effective depth = pre + rec*K + cod); K=2 → ~540 steps/5min
-USE_GATE          = False  # P4d: no gate — pure LoRA step-specialization test
+K_RECURSE      = 4      # P4g: K=4 — train at multiple depths, sweep K=1,2,3,4 at inference (Phase 3)
+USE_GATE          = False  # no gate — clean ablation: does more recurrence help?
 GATE_FROM_PRELUDE = True   # True = gate from prelude e; stable + token-specific
 GATE_FROM_DIFF    = False  # gate_from_diff unstable at scale=0.1 (oscillates gate ceiling→floor → NaN)
 GATE_MIN          = 0.1    # standard floor
@@ -785,16 +785,16 @@ GATE_MIN_INIT     = 0.1    # no curriculum
 LAMBDA_GATE       = 0.0    # no penalty
 VAR_REWARD        = 0.0
 STEP_EMBED_SCALE  = 0.1
-INJECT_INIT       = "identity"  # same as P3a baseline for clean comparison
-LORA_RANK         = 8     # fixed K=2: both adapters always train, rank=8 gives more capacity
-LORA_LR           = 0.02  # P4f: try higher LoRA LR (P4e used 0.004=unembedding_lr, too low for step specialization)
-RANDOM_K          = False  # fixed K=2 so step-1 LoRA always gets gradient on every step
+INJECT_INIT       = "identity"
+LORA_RANK         = 0      # no LoRA — clean test
+LORA_LR           = 0.004  # unused (LORA_RANK=0)
+RANDOM_K          = True   # sample K∈{1,2,3,4} each step — more optimizer steps than fixed K=4
 USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× activation memory → BS=128 with K=4)
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
 TIME_BUDGET = _BASE_TIME_BUDGET  # 5-min standard
-RUN_NAME = "p4f-lora8-lr0.02"  # LoRA rank=8, fixed K=2, higher LR 0.02 — can step specialization beat P3a (1.046)?
+RUN_NAME = "p4g-k4-randomk"  # K=4 RANDOM_K — Phase 3: does K=4 beat K=2? K-sweep at inference shows compute-quality tradeoff
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1091,40 @@ if USE_RECURSIVE and USE_GATE and final_gate_std > 0.05 and K_RECURSE > 1:
         _sweep_log[f"sweep/tau{_tau:.1f}_eff_k"] = _eff_k
     print(f"{'P3a ref':>10} {'~50%':>8} {'~1.50':>7} {'1.046300':>12}  RANDOM_K no-gate baseline")
     wandb.log(_sweep_log)
+
+# ---------------------------------------------------------------------------
+# K-sweep (inference compute vs quality): test K=1..K_RECURSE at inference
+# Only runs for recursive models with K_RECURSE > 1 and no gate (gate would invalidate k_override)
+# ---------------------------------------------------------------------------
+if USE_RECURSIVE and not USE_GATE and K_RECURSE > 1:
+    print("\n--- K Sweep (inference compute vs val_bpb) ---")
+    print(f"{'K':>6} {'eff_depth':>10} {'val_bpb':>12}  note")
+    _orig = getattr(model, '_orig_mod', model)
+    _orig.eval()
+    _token_bytes = get_token_bytes(device=device)
+    _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+    _ksweep_log = {}
+    for _k in range(1, K_RECURSE + 1):
+        _total_nats = 0.0; _total_bytes = 0
+        _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
+        with torch.no_grad(), autocast_ctx:
+            for _ in range(_sweep_steps):
+                _x, _y, _ = next(_val_loader)
+                _ce, _, __, ___ = _orig(_x.to(device), _y.to(device), reduction='none', k_override=_k)
+                _loss_flat = _ce.view(-1)
+                _y_flat = _y.view(-1)
+                _nb = _token_bytes[_y_flat]
+                _mask = _nb > 0
+                _total_nats += (_loss_flat * _mask).sum().item()
+                _total_bytes += _nb.sum().item()
+        _bpb = _total_nats / (math.log(2) * _total_bytes)
+        _eff_depth = 2 + _k * 4 + 2  # prelude(2) + recur(4)*K + coda(2)
+        _note = " ← trained max K" if _k == K_RECURSE else (" ← min compute" if _k == 1 else "")
+        print(f"{_k:>6} {_eff_depth:>10} {_bpb:>12.6f}{_note}")
+        _ksweep_log[f"ksweep/k{_k}_bpb"] = _bpb
+        _ksweep_log[f"ksweep/k{_k}_eff_depth"] = _eff_depth
+    print(f"  ref: P3a K=2 RANDOM_K val_bpb=1.046300, B1 standard GPT (8 layers) val_bpb=0.996400")
+    wandb.log(_ksweep_log)
 
 wandb.finish()
 
