@@ -776,15 +776,15 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    USE_RECURSIVE  = False  # P4o: standard GPT 80-min — complete scaling curve at 80-min
+    USE_RECURSIVE  = True   # P4p: K=2 gated, VAR=0.2 — find sweet spot between 0.1 (4% hard, unstable) and 0.3 (52% hard)
     K_RECURSE      = 2
-    USE_GATE          = False
+    USE_GATE          = True
     GATE_FROM_PRELUDE = True
     GATE_FROM_DIFF    = False
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
     LAMBDA_GATE       = 0.0
-    VAR_REWARD        = 0.0
+    VAR_REWARD        = 0.2   # middle of 0.1 (sometimes collapses) and 0.3 (stable but 52% hard); target ~20-30% hard tokens
     STEP_EMBED_SCALE  = 0.1
     INJECT_INIT       = "identity"
     LORA_RANK         = 0
@@ -793,8 +793,8 @@ if __name__ == "__main__":
     USE_GRAD_CKPT  = True
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: iso-compute reference for P4n
-    RUN_NAME = "p4o-standard-80min"  # P4o: standard GPT 80-min iso-compute reference
+    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: gate sweet spot search (same duration as P4i/P4m)
+    RUN_NAME = "p4p-var0.2-gate"  # P4p: VAR=0.2 gate; sweet spot between VAR=0.1 (unstable 4% hard) and VAR=0.3 (stable 52% hard)
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
