@@ -7,7 +7,7 @@ REMOTE="root@64.247.201.46"
 PORT="10926"
 KEY="$HOME/.ssh/runpod_vibe"
 WANDB="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"
-COMMIT="9cc6035"  # P4r: 80-min gated VAR=0.3+LAMBDA=0.15
+COMMIT="33b8a1e"  # P4r: 80-min gated VAR=0.3+LAMBDA=0.15 + checkpoint for all recursive models
 
 ssh_cmd() {
     ssh -o StrictHostKeyChecking=no "$REMOTE" -p "$PORT" -i "$KEY" "$@"
