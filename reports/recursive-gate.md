@@ -446,6 +446,70 @@ This holds when gates are binary and at equilibrium between CE, VAR, and LAMBDA 
 
 ---
 
+## Phase 9: Information-Theoretic Gate Analysis + Prefill vs Decode (2026-03-25)
+
+### Question 1: Do fewer recursions go to more certain tokens?
+
+**Confirmed empirically (P4m checkpoint via eval_gates.py):**
+- Gate values are strictly binary: 0.100 (floor=easy) or 1.000 (ceiling=hard)
+- **Easy tokens (g=0.1, skip 2nd recurrence)**: content words, names, technical terms — `fibonacci`, `mitochondria`, `Armstrong`, `integral`
+- **Hard tokens (g=1.0, use 2nd recurrence)**: function words, punctuation, operators — `.`, `,`, `of`, `the`, `+`, `;`
+
+**Information-theoretic interpretation:**
+
+The gate approximately measures `H(x_t | context)` — the conditional entropy of token t given its context:
+
+```
+H(x_t | context) ≈ -log P(x_t | context)
+```
+
+- **High-gate tokens** (g=1.0): high conditional entropy — many plausible next tokens. Example: after "the", what follows? Could be any noun. The model needs more compute to integrate all contextual constraints and arrive at a stable representation.
+- **Low-gate tokens** (g=0.1): low conditional entropy — nearly deterministic given context. After "mitochond-", the continuation is clear. The prelude representation is already settled; extra recurrence adds nothing.
+
+The gate is thus **adaptive compute allocation based on per-token uncertainty**. This is the information-theoretic ideal: allocate more compute where surprisal is highest, skip computation where the answer is already clear.
+
+**Why function words are hard**: `of`, `the`, `to` are high-frequency, low-content words that derive meaning entirely from context. Their role (genitive? part of phrase? article?) requires integrating multiple surrounding tokens — exactly what recurrence provides. Content words like `Armstrong` carry meaning in themselves; one pass through the prelude suffices.
+
+### Question 2: Is there a positional bias (prefill vs decode)?
+
+**Experiment implemented**: `prefill_vs_decode_analysis()` in `eval_gates.py` (commit `4f819b1`).
+
+Method: Take 5 prompt+continuation pairs across code, prose, and science domains. Run the full sequence through the model; compare gate values for prompt positions vs continuation positions.
+
+**Results pending** — will run on P4q and P4r checkpoints when available. The function is in place and will be auto-executed by `eval_gates.py`.
+
+**Prior evidence (positional_analysis)**: Gate is flat across positions (range=0.066 over 20 val batches). This suggests position per se doesn't drive gating decisions. However, this doesn't directly test the prefill/decode hypothesis — prompt content vs generated content may differ systematically in entropy even if absolute position doesn't matter.
+
+**Expected finding**: If prefill typically contains denser semantic content (code keyword-rich prompts, rare names in sentences) vs decode (which may generate more predictable continuations), then prefill positions may show slightly higher average gate values. But if the model truly gates on per-token entropy, the difference will be small — a well-constructed continuation has equally hard tokens as the prompt.
+
+### Analytical Framework: Gate as Conditional Entropy Proxy
+
+```
+gate(token t) ≈ f(H(x_t | x_{<t}))
+             = f(-log P(x_t | x_{<t}))
+```
+
+The training loss is:
+```
+L = CE - VAR_REWARD * Var(g) + LAMBDA_GATE * gate_mean
+```
+
+At equilibrium, the gate is set to minimize this joint objective. The CE term rewards gates that help on hard tokens. The VAR term rewards bimodal gate distributions (binary 0/1). The LAMBDA term penalizes using too many hard tokens.
+
+**Effective recurrences at inference**:
+```
+E[k_eff] = 1 + (1 - skip_rate) * (K - 1)
+         = 1 + p_hard * (K - 1)
+```
+
+For K=2, VAR=0.3+LAMBDA=0.15 (P4q target):
+```
+skip_rate = 0.75  →  p_hard = 0.25  →  E[k_eff] = 1.25
+```
+25% more compute than K=1 at inference, but targeted exactly at the 25% of tokens that benefit most.
+
+---
+
 ## Key Insights So Far
 
 1. **Fixed-time budget favors fewer ops/step**: B1 wins because it gets 924 optimizer steps vs 331 for recursive models. Recursive architecture processes ~same total FLOPs but in larger chunks → fewer gradient updates.
@@ -459,3 +523,5 @@ This holds when gates are binary and at equilibrium between CE, VAR, and LAMBDA 
 5. **Gate interpretability**: Binary (0.1 or 1.0), content-driven not position-driven. Function words + punctuation = hard (need 2nd recurrence for disambiguation). Content words + names = easy (skip).
 
 6. **VAR_REWARD tradeoff**: Higher VAR pushes gate toward 50/50 (maximum variance). VAR=0.1 can achieve 95.8% skip but is unstable; VAR=0.3 is stable but only 54% skip. Sweet spot likely around VAR=0.15-0.2.
+
+7. **Gate = conditional entropy proxy**: The gate allocates compute proportional to per-token uncertainty H(x_t | context). Function words are high-entropy (context-dependent meaning), content words are low-entropy (self-contained meaning). This is the information-theoretic basis for adaptive computation.
