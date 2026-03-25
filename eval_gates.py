@@ -269,6 +269,54 @@ def main():
     # Bulk positional analysis over validation data
     positional_analysis(model, tokenizer, device)
 
+    # K-sweep: measure val_bpb at K=1, K=2, and gate-controlled (various thresholds)
+    if torch.cuda.is_available():  # requires GPU for evaluate_bpb (uses CUDA token_bytes)
+        k_sweep_analysis(model, tokenizer, device, k_recurse)
+
+
+def k_sweep_analysis(model, tokenizer, device, k_recurse):
+    """Measure val_bpb at K=1, K=2, and various gate thresholds.
+
+    This quantifies the value of adaptive gating vs fixed K:
+    - K=1: cheapest inference (1 recurrence)
+    - K=max: most expensive (k_recurse recurrences)
+    - K=gate(τ): adaptive — skips recurrence for easy tokens
+    """
+    from prepare import evaluate_bpb
+    print(f"\n{'='*70}")
+    print("K-SWEEP: val_bpb vs inference compute")
+
+    configs = []
+    for k in range(1, k_recurse + 1):
+        configs.append({"label": f"K={k} (fixed)", "k_override": k, "gate_threshold": 0.0})
+    for tau in [0.2, 0.3, 0.5, 0.7]:
+        configs.append({"label": f"gate(τ={tau:.1f})", "k_override": None, "gate_threshold": tau})
+
+    results = []
+    DEVICE_BATCH_SIZE = 8
+    for cfg in configs:
+        k_ov = cfg["k_override"]
+        tau = cfg["gate_threshold"]
+
+        class _KModel:
+            def __call__(self_inner, x, y, reduction='mean'):
+                with torch.amp.autocast(device_type='cuda' if device != 'cpu' else 'cpu', dtype=torch.bfloat16):
+                    out = model(x, y, reduction=reduction, k_override=k_ov, gate_threshold=tau)
+                # RecursiveGPT returns (ce, gate_mean, gate_std, skip_frac) or 5-tuple
+                return out[0] if isinstance(out, tuple) else out
+
+        bpb = evaluate_bpb(_KModel(), tokenizer, DEVICE_BATCH_SIZE)
+        results.append((cfg["label"], bpb))
+        print(f"  {cfg['label']:25s}  bpb={bpb:.4f}")
+
+    print(f"\n  Reference: P4a (K=2 no-gate 20-min)=0.9603, P4b (standard GPT 20-min)=0.9413")
+    fixed = [(l, b) for l, b in results if 'fixed' in l]
+    gated = [(l, b) for l, b in results if 'gate' in l]
+    if fixed:
+        print(f"  Best fixed K: {min(b for _, b in fixed):.4f} ({min(fixed, key=lambda x: x[1])[0]})")
+    if gated:
+        print(f"  Best gated:  {min(b for _, b in gated):.4f} ({min(gated, key=lambda x: x[1])[0]})")
+
 
 if __name__ == "__main__":
     main()
