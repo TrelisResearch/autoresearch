@@ -62,6 +62,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | **P4g** | **K=4 RANDOM_K, no gate — Phase 3 K-sweep** | **1.0797** | — | — | — | **468** | **K-sweep: K=1→1.089, K=2→1.082, K=3→1.080, K=4→1.080** |
 | **P4h** | **K=4 RANDOM_K, 20-min — K-sweep at 20-min quality** | **0.9701** | — | — | — | **1820** | **K-sweep K=1→0.987, K=4→0.970. K-benefit grows with training (0.009→0.017)** |
 | **P4i** | **K=2 RANDOM_K, gate, VAR_REWARD=0.1, 20-min** | **0.9612** | **0.1318** | **0.1672** | **1.13** | **2510** | **BREAKTHROUGH: 95.8% tokens skip 2nd recurrence, costs only 0.003 bpb** |
+| **P4j** | **K=2 RANDOM_K, 40-min (no gate)** | **0.9384** | — | — | 1.00 | **5061** | **Beats 20-min standard GPT (0.9413)! Gap continues to narrow.** |
+| P4k | Standard GPT 40-min reference | TBD | — | — | — | ~7500 | running: complete scaling curve to 40-min |
 
 ---
 
@@ -251,6 +253,19 @@ When gate < τ: token skips second recurrence (g set to 0 → s unchanged). Meas
 2. **K=1 (0.987) beats 5-min standard GPT (0.996)** at 20-min training — even the cheapest inference option from the K=4 model outperforms a freshly trained 5-min standard GPT!
 3. **K=4 gap from K=2 persists**: 0.970 vs 0.960. The step-count penalty (28% fewer steps) still dominates at 20 min.
 4. **Hypothesis**: at 40-60 min training, K=4 should match or beat K=2 because the K-benefit curve is steeper than the step-count penalty curve.
+
+### P4j — 40-min K=2 RANDOM_K (no gate): recursive beats 20-min standard GPT!
+- **val_bpb: 0.9384**, 5061 steps, 40-min — **beats P4b (standard GPT 20-min: 0.9413)**!
+- This is a meaningful crossover: a recursive model trained for 40-min outperforms standard GPT trained for 20-min.
+- P4k (standard GPT 40-min) is running to see the iso-time 40-min comparison.
+
+**Complete compute scaling curve (so far):**
+
+| Training time | Recursive K=2 | Standard GPT | Gap |
+|---|---|---|---|
+| 5-min | 1.0463 | 0.9964 | 0.050 |
+| 20-min | 0.9603 | 0.9413 | 0.019 |
+| 40-min | **0.9384** | TBD (P4k) | ? |
 
 ---
 
