@@ -44,7 +44,13 @@ def load_model(ckpt_path):
     n_rec = sum(1 for k in sd if k.startswith("transformer.rec.") and k.endswith(".attn.c_q.weight"))
     n_pre = sum(1 for k in sd if k.startswith("transformer.pre.") and k.endswith(".attn.c_q.weight"))
     n_cod = sum(1 for k in sd if k.startswith("transformer.cod.") and k.endswith(".attn.c_q.weight"))
-    n_head = sd["transformer.pre.0.attn.c_q.weight"].shape[0] // (n_embd // sd["transformer.pre.0.attn.c_q.weight"].shape[1])
+    # Infer n_head from ve_gate.weight shape=(n_kv_head, 32); fall back to c_q shape heuristic
+    ve_gate_key = next((k for k in sd if "ve_gate.weight" in k), None)
+    if ve_gate_key is not None:
+        n_head = sd[ve_gate_key].shape[0]
+    else:
+        # c_q.weight shape = (n_head * head_dim, n_embd); assume HEAD_DIM=128
+        n_head = sd["transformer.pre.0.attn.c_q.weight"].shape[0] // 128
     # Infer K from step_embeds
     k_recurse = sd["step_embeds"].shape[0]
     use_gate = "gate_proj.weight" in sd
