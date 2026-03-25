@@ -793,8 +793,8 @@ USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks (saves ~K× act
 # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
 # Experiment tracking
-TIME_BUDGET = _BASE_TIME_BUDGET  # 5-min standard
-RUN_NAME = "p4g-k4-randomk"  # K=4 RANDOM_K — Phase 3: does K=4 beat K=2? K-sweep at inference shows compute-quality tradeoff
+TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: test if K=4 beats K=2 at longer training (P4a was K=2 20-min: 0.960)
+RUN_NAME = "p4h-k4-randomk-20min"  # K=4 RANDOM_K, 20-min: does K=4 beat K=2 at longer training? K-sweep shows tradeoff
 WANDB_PROJECT = "autoresearch-recursive-gate"
 
 # ---------------------------------------------------------------------------
