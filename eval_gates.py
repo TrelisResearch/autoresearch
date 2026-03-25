@@ -54,7 +54,18 @@ def load_model(ckpt_path):
     # Infer K from step_embeds
     k_recurse = sd["step_embeds"].shape[0]
     use_gate = "gate_proj.weight" in sd
-    gate_from_prelude = use_gate  # all our runs use gate_from_prelude=True
+    # Infer gate variant from gate_proj input size:
+    #   gate_proj.weight shape = (1, gate_in_dim)
+    #   gate_in_dim == n_embd → gate_from_prelude or gate_from_diff (use prelude-only path)
+    #   gate_in_dim == 2*n_embd → gate_from_postlude0 or default cat[u,s] (use postlude0 path)
+    gate_from_prelude = False
+    gate_from_postlude0 = False
+    if use_gate:
+        gate_in_dim = sd["gate_proj.weight"].shape[1]
+        if gate_in_dim == n_embd:
+            gate_from_prelude = True
+        else:
+            gate_from_postlude0 = True  # cat[e, s_k0] gate
 
     cfg = GPTConfig(
         sequence_len=MAX_SEQ_LEN,
@@ -70,12 +81,16 @@ def load_model(ckpt_path):
         use_gate=use_gate,
         gate_from_prelude=gate_from_prelude,
         gate_from_diff=False,
+        gate_from_postlude0=gate_from_postlude0,
         gate_min=0.1,
         step_embed_scale=0.1,
         inject_init="identity",
         lora_rank=0,
         use_grad_ckpt=False,
     )
+    if use_gate:
+        variant = "gate_from_prelude" if gate_from_prelude else ("gate_from_postlude0" if gate_from_postlude0 else "gate_default")
+        print(f"  Gate variant: {variant} (gate_proj input dim={gate_in_dim})")
     model.load_state_dict(sd)
     model.eval()
     model.bfloat16()  # FA3 requires bf16/fp16 inputs
