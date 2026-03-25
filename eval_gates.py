@@ -17,6 +17,7 @@ import math
 import torch
 import torch.nn.functional as F
 from prepare import Tokenizer, MAX_SEQ_LEN
+from train import RecursiveGPT, GPTConfig  # safe: training code guarded by if __name__ == "__main__"
 
 # ANSI color helpers
 def color_token(text, gate_val, gate_min=0.1):
@@ -35,14 +36,6 @@ def color_token(text, gate_val, gate_min=0.1):
 
 def load_model(ckpt_path):
     """Load RecursiveGPT from checkpoint, infer config from state dict."""
-    # Import RecursiveGPT from train.py
-    import importlib.util, os
-    spec = importlib.util.spec_from_file_location(
-        "train", os.path.join(os.path.dirname(os.path.abspath(__file__)), "train.py"))
-    # We can't exec train.py fully (it runs training), so import just the classes.
-    # Instead, replicate the model construction from the checkpoint keys.
-    from train import RecursiveGPT, GPTConfig
-
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
     # Infer config from state dict
@@ -67,17 +60,15 @@ def load_model(ckpt_path):
     )
     model = RecursiveGPT(
         cfg,
-        n_pre=n_pre, n_rec=n_rec, n_cod=n_cod,
         k_recurse=k_recurse,
         use_gate=use_gate,
         gate_from_prelude=gate_from_prelude,
         gate_from_diff=False,
         gate_min=0.1,
-        gate_min_init=0.1,
         step_embed_scale=0.1,
         inject_init="identity",
         lora_rank=0,
-        use_grad_ckpt=False,   # no grad ckpt at eval
+        use_grad_ckpt=False,
     )
     model.load_state_dict(sd)
     model.eval()

@@ -303,7 +303,7 @@ class GPT(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RecursiveGPT(nn.Module):
-    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False, gate_from_diff=False):
+    def __init__(self, config, k_recurse=4, use_gate=False, gate_min=0.1, lora_rank=0, use_grad_ckpt=False, gate_from_prelude=False, gate_from_diff=False, step_embed_scale=0.1, inject_init="identity"):
         super().__init__()
         self.config = config
         self.k_recurse = k_recurse
@@ -371,7 +371,7 @@ class RecursiveGPT(nn.Module):
         # → (u-s) is meaningful from step 0 → gate has real gradient signal early
         # step_embed_scale=0.01: tiny (u-s), gate gradient ∝ 0.01 → needs VAR_REWARD to keep alive
         # step_embed_scale=0.1:  large (u-s), gate gradient 10× larger → may sustain gate without VAR_REWARD
-        self.step_embeds = nn.Parameter(torch.randn(k_recurse, n_embd) * STEP_EMBED_SCALE)
+        self.step_embeds = nn.Parameter(torch.randn(k_recurse, n_embd) * step_embed_scale)
 
         # Optional per-step LoRA on inject (helps model distinguish recursion depth)
         if lora_rank > 0:
@@ -424,7 +424,7 @@ class RecursiveGPT(nn.Module):
         # Inject init: controlled by INJECT_INIT global
         # "identity": [I | 0] — inject ignores s at init; slow to learn s-dependence → k=1≈k=0
         # "symmetric": [0.5*I | 0.5*I] — inject blends e+s equally → k=1 refines based on k=0 output
-        if INJECT_INIT == "symmetric":
+        if inject_init == "symmetric":
             self.inject.weight.data[:, :n_embd] = 0.5 * torch.eye(n_embd)
             self.inject.weight.data[:, n_embd:] = 0.5 * torch.eye(n_embd)
         else:
@@ -752,417 +752,415 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+if __name__ == "__main__":
+    ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+    HEAD_DIM = 128          # target head dimension for attention
+    WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.06        # learning rate for matrix parameters (Muon) — 0.06 best from initial-tests
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
+    # Optimization
+    TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+    EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
+    UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
+    MATRIX_LR = 0.06        # learning rate for matrix parameters (Muon) — 0.06 best from initial-tests
+    SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
+    WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+    ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+    WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+    WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+    FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers (ignored when USE_RECURSIVE=True)
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+    # Model size
+    DEPTH = 8               # number of transformer layers (ignored when USE_RECURSIVE=True)
+    DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
-# Recursive architecture
-USE_RECURSIVE  = True   # P4l: gated recursive — checkpoint + eval_gates.py to verify hard-token hypothesis
-K_RECURSE      = 2      # K=2: same as P4i
-USE_GATE          = True   # gate enabled — VAR_REWARD forces bimodal distribution
-GATE_FROM_PRELUDE = True   # gate from prelude e (avoids dead gradient collapse)
-GATE_FROM_DIFF    = False
-GATE_MIN          = 0.1    # standard floor
-GATE_MIN_INIT     = 0.1    # no curriculum
-LAMBDA_GATE       = 0.0    # no sparsity penalty — let VAR_REWARD drive gate diversity
-VAR_REWARD        = 0.1    # P4i sweet spot: gate_std=0.167, 95.8% skip at τ=0.2
-STEP_EMBED_SCALE  = 0.1
-INJECT_INIT       = "identity"
-LORA_RANK         = 0      # no LoRA
-LORA_LR           = 0.004
-RANDOM_K          = True   # more optimizer steps via variable K
-USE_GRAD_CKPT  = True   # gradient checkpointing on recur blocks
-# When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
+    # Recursive architecture
+    USE_RECURSIVE  = True   # P4m: gated recursive VAR=0.3 — test if higher VAR fixes gate collapse vs P4l
+    K_RECURSE      = 2      # K=2
+    USE_GATE          = True   # gate enabled
+    GATE_FROM_PRELUDE = True   # gate from prelude e
+    GATE_FROM_DIFF    = False
+    GATE_MIN          = 0.1
+    GATE_MIN_INIT     = 0.1
+    LAMBDA_GATE       = 0.0
+    VAR_REWARD        = 0.3    # P4m: 3× stronger than P4l (0.1) — should force more bimodal gate
+    STEP_EMBED_SCALE  = 0.1
+    INJECT_INIT       = "identity"
+    LORA_RANK         = 0
+    LORA_LR           = 0.004
+    RANDOM_K          = True
+    USE_GRAD_CKPT  = True
+    # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
-# Experiment tracking
-TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min: match P4i duration for clean comparison
-RUN_NAME = "p4l-gated-checkpoint"  # P4l: gated K=2 VAR=0.1 20-min + checkpoint for eval_gates.py
-WANDB_PROJECT = "autoresearch-recursive-gate"
+    # Experiment tracking
+    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min
+    RUN_NAME = "p4m-var0.3-gate"  # P4m: gated K=2 VAR_REWARD=0.3, diagnose gate collapse from P4l
+    WANDB_PROJECT = "autoresearch-recursive-gate"
 
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Setup: tokenizer, model, optimizer, dataloader
+    # ---------------------------------------------------------------------------
 
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+    t_start = time.time()
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.set_float32_matmul_precision("high")
+    device = torch.device("cuda")
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    H100_BF16_PEAK_FLOPS = 989.5e12
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
+    tokenizer = Tokenizer.from_directory()
+    vocab_size = tokenizer.get_vocab_size()
+    print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+    def build_model_config(depth):
+        base_dim = depth * ASPECT_RATIO
+        model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+        num_heads = model_dim // HEAD_DIM
+        return GPTConfig(
+            sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=WINDOW_PATTERN,
+        )
+
+    # For recursive model, unique layer count = 2+4+2=8; for standard use DEPTH
+    _depth = (2 + 4 + 2) if USE_RECURSIVE else DEPTH
+    config = build_model_config(_depth)
+    print(f"Model config: {asdict(config)}")
+    print(f"Mode: {'RECURSIVE K=' + str(K_RECURSE) + ' lambda=' + str(LAMBDA_GATE) + ' lora_rank=' + str(LORA_RANK) if USE_RECURSIVE else 'STANDARD'}")
+
+    wandb.login(key=os.environ.get("WANDB_API_KEY"))
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=RUN_NAME,
+        config=dict(
+            use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN, gate_min_init=GATE_MIN_INIT, inject_init=INJECT_INIT,
+            lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
+            lora_rank=LORA_RANK, lora_lr=LORA_LR, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
+            gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
+            depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
+            window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
+            embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
+            matrix_lr=MATRIX_LR, scalar_lr=SCALAR_LR, weight_decay=WEIGHT_DECAY,
+            adam_betas=ADAM_BETAS, warmup_ratio=WARMUP_RATIO,
+            warmdown_ratio=WARMDOWN_RATIO, final_lr_frac=FINAL_LR_FRAC,
+        ),
     )
 
-# For recursive model, unique layer count = 2+4+2=8; for standard use DEPTH
-_depth = (2 + 4 + 2) if USE_RECURSIVE else DEPTH
-config = build_model_config(_depth)
-print(f"Model config: {asdict(config)}")
-print(f"Mode: {'RECURSIVE K=' + str(K_RECURSE) + ' lambda=' + str(LAMBDA_GATE) + ' lora_rank=' + str(LORA_RANK) if USE_RECURSIVE else 'STANDARD'}")
-
-wandb.login(key=os.environ.get("WANDB_API_KEY"))
-wandb.init(
-    project=WANDB_PROJECT,
-    name=RUN_NAME,
-    config=dict(
-        use_recursive=USE_RECURSIVE, k_recurse=K_RECURSE, gate_min=GATE_MIN, gate_min_init=GATE_MIN_INIT, inject_init=INJECT_INIT,
-        lambda_gate=LAMBDA_GATE, var_reward=VAR_REWARD, random_k=RANDOM_K,
-        lora_rank=LORA_RANK, lora_lr=LORA_LR, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE,
-        gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE,
-        depth=_depth, aspect_ratio=ASPECT_RATIO, head_dim=HEAD_DIM,
-        window_pattern=WINDOW_PATTERN, total_batch_size=TOTAL_BATCH_SIZE,
-        embedding_lr=EMBEDDING_LR, unembedding_lr=UNEMBEDDING_LR,
-        matrix_lr=MATRIX_LR, scalar_lr=SCALAR_LR, weight_decay=WEIGHT_DECAY,
-        adam_betas=ADAM_BETAS, warmup_ratio=WARMUP_RATIO,
-        warmdown_ratio=WARMDOWN_RATIO, final_lr_frac=FINAL_LR_FRAC,
-    ),
-)
-
-with torch.device("meta"):
-    if USE_RECURSIVE:
-        model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE, gate_from_diff=GATE_FROM_DIFF)
-    else:
-        model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-_opt_kwargs = dict(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
-if USE_RECURSIVE and LORA_RANK > 0:
-    _opt_kwargs['lora_lr'] = LORA_LR
-optimizer = model.setup_optimizer(**_opt_kwargs)
-
-model = torch.compile(model, dynamic=False)
-
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-# Schedules (all based on progress = training_time / TIME_BUDGET)
-
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
-
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
-
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
-
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    gate_mean_accum = 0.0
-    gate_std_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            if USE_RECURSIVE:
-                k_eff = random.randint(1, K_RECURSE) if RANDOM_K else K_RECURSE
-                ce, gate_mean_t, gate_std_t, _ = model(x, y, k_override=k_eff)
-                # gate_mean penalty/reward + variance reward (rewards gate heterogeneity across tokens)
-                loss = ce + LAMBDA_GATE * gate_mean_t - VAR_REWARD * (gate_std_t ** 2)
-                gate_mean_accum += gate_mean_t.detach().item()
-                gate_std_accum += gate_std_t.detach().item()
-            else:
-                loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
-    gate_mean_val = gate_mean_accum / grad_accum_steps if USE_RECURSIVE else 0.0
-    gate_std_val = gate_std_accum / grad_accum_steps if USE_RECURSIVE else 0.0
-
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    # Gate-min curriculum: decay gate_min from GATE_MIN_INIT → GATE_MIN over training
-    # Use in-place fill_ to avoid torch.compile recompilation (buffer tensor identity unchanged)
-    if USE_RECURSIVE and USE_GATE and hasattr(model, '_gate_min_t'):
-        model._gate_min_t.fill_(GATE_MIN + (GATE_MIN_INIT - GATE_MIN) * (1.0 - progress))
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
-
-    train_loss_f = train_loss.item()
-
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 10:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    gate_str = f" | gate_mean: {gate_mean_val:.3f} std: {gate_std_val:.3f}" if USE_RECURSIVE else ""
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}%{gate_str} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    if step % 10 == 0:
-        log_dict = {"train/loss": debiased_smooth_loss, "train/lrm": lrm,
-                    "train/mfu": mfu, "train/tok_per_sec": tok_per_sec,
-                    "train/step_ms": dt * 1000}
+    with torch.device("meta"):
         if USE_RECURSIVE:
-            log_dict["train/gate_mean"] = gate_mean_val
-            log_dict["train/gate_std"] = gate_std_val
-        wandb.log(log_dict, step=step)
+            model = RecursiveGPT(config, k_recurse=K_RECURSE, use_gate=USE_GATE, gate_min=GATE_MIN, lora_rank=LORA_RANK, use_grad_ckpt=USE_GRAD_CKPT, gate_from_prelude=GATE_FROM_PRELUDE, gate_from_diff=GATE_FROM_DIFF, step_embed_scale=STEP_EMBED_SCALE, inject_init=INJECT_INIT)
+        else:
+            model = GPT(config)
+    model.to_empty(device=device)
+    model.init_weights()
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+    param_counts = model.num_scaling_params()
+    print("Parameter counts:")
+    for key, value in param_counts.items():
+        print(f"  {key:24s}: {value:,}")
+    num_params = param_counts['total']
+    num_flops_per_token = model.estimate_flops()
+    print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-    step += 1
+    tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
+    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+    _opt_kwargs = dict(
+        unembedding_lr=UNEMBEDDING_LR,
+        embedding_lr=EMBEDDING_LR,
+        scalar_lr=SCALAR_LR,
+        adam_betas=ADAM_BETAS,
+        matrix_lr=MATRIX_LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+    if USE_RECURSIVE and LORA_RANK > 0:
+        _opt_kwargs['lora_lr'] = LORA_LR
+    optimizer = model.setup_optimizer(**_opt_kwargs)
 
-print()  # newline after \r training log
+    model = torch.compile(model, dynamic=False)
 
-total_tokens = step * TOTAL_BATCH_SIZE
+    train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+    x, y, epoch = next(train_loader)  # prefetch first batch
 
-# Final eval
-model.eval()
-with autocast_ctx:
-    if USE_RECURSIVE:
-        # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean, gate_std) tuple
-        class _CEOnlyModel:
-            def __call__(self, x, y, reduction='mean'):
-                ce, _, __, ___ = model(x, y, reduction=reduction)
-                return ce
-        val_bpb = evaluate_bpb(_CEOnlyModel(), tokenizer, DEVICE_BATCH_SIZE)
-    else:
-        val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    # Schedules (all based on progress = training_time / TIME_BUDGET)
 
-# Compute final gate_mean/gate_std from eval pass if recursive
-final_gate_mean = 0.0
-final_gate_std = 0.0
-if USE_RECURSIVE:
+    def get_lr_multiplier(progress):
+        if progress < WARMUP_RATIO:
+            return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+        elif progress < 1.0 - WARMDOWN_RATIO:
+            return 1.0
+        else:
+            cooldown = (1.0 - progress) / WARMDOWN_RATIO
+            return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+
+    def get_muon_momentum(step):
+        frac = min(step / 300, 1)
+        return (1 - frac) * 0.85 + frac * 0.95
+
+    def get_weight_decay(progress):
+        return WEIGHT_DECAY * (1 - progress)
+
+    # ---------------------------------------------------------------------------
+    # Training loop
+    # ---------------------------------------------------------------------------
+
+    t_start_training = time.time()
+    smooth_train_loss = 0
+    total_training_time = 0
+    step = 0
+
+    while True:
+        torch.cuda.synchronize()
+        t0 = time.time()
+        gate_mean_accum = 0.0
+        gate_std_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                if USE_RECURSIVE:
+                    k_eff = random.randint(1, K_RECURSE) if RANDOM_K else K_RECURSE
+                    ce, gate_mean_t, gate_std_t, _ = model(x, y, k_override=k_eff)
+                    # gate_mean penalty/reward + variance reward (rewards gate heterogeneity across tokens)
+                    loss = ce + LAMBDA_GATE * gate_mean_t - VAR_REWARD * (gate_std_t ** 2)
+                    gate_mean_accum += gate_mean_t.detach().item()
+                    gate_std_accum += gate_std_t.detach().item()
+                else:
+                    loss = model(x, y)
+            train_loss = loss.detach()
+            loss = loss / grad_accum_steps
+            loss.backward()
+            x, y, epoch = next(train_loader)
+        gate_mean_val = gate_mean_accum / grad_accum_steps if USE_RECURSIVE else 0.0
+        gate_std_val = gate_std_accum / grad_accum_steps if USE_RECURSIVE else 0.0
+
+        # Progress and schedules
+        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        lrm = get_lr_multiplier(progress)
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(progress)
+        # Gate-min curriculum: decay gate_min from GATE_MIN_INIT → GATE_MIN over training
+        # Use in-place fill_ to avoid torch.compile recompilation (buffer tensor identity unchanged)
+        if USE_RECURSIVE and USE_GATE and hasattr(model, '_gate_min_t'):
+            model._gate_min_t.fill_(GATE_MIN + (GATE_MIN_INIT - GATE_MIN) * (1.0 - progress))
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group['kind'] == 'muon':
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+        train_loss_f = train_loss.item()
+
+        # Fast fail: abort if loss is exploding or NaN
+        if math.isnan(train_loss_f) or train_loss_f > 100:
+            print("FAIL")
+            exit(1)
+
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
+
+        if step > 10:
+            total_training_time += dt
+
+        # Logging
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
+        pct_done = 100 * progress
+        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+        mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        gate_str = f" | gate_mean: {gate_mean_val:.3f} std: {gate_std_val:.3f}" if USE_RECURSIVE else ""
+        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}%{gate_str} | remaining: {remaining:.0f}s    ", end="", flush=True)
+
+        if step % 10 == 0:
+            log_dict = {"train/loss": debiased_smooth_loss, "train/lrm": lrm,
+                        "train/mfu": mfu, "train/tok_per_sec": tok_per_sec,
+                        "train/step_ms": dt * 1000}
+            if USE_RECURSIVE:
+                log_dict["train/gate_mean"] = gate_mean_val
+                log_dict["train/gate_std"] = gate_std_val
+            wandb.log(log_dict, step=step)
+
+        # GC management (Python's GC causes ~500ms stalls)
+        if step == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (step + 1) % 5000 == 0:
+            gc.collect()
+
+        step += 1
+
+        # Time's up — but only stop after warmup steps so we don't count compilation
+        if step > 10 and total_training_time >= TIME_BUDGET:
+            break
+
+    print()  # newline after \r training log
+
+    total_tokens = step * TOTAL_BATCH_SIZE
+
+    # Final eval
     model.eval()
-    with autocast_ctx, torch.no_grad():
-        eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
-        ex, ey, _ = next(eval_loader)
-        _, gm, gs, _ = model(ex.to(device), ey.to(device))
-        final_gate_mean = gm.item()
-        final_gate_std = gs.item()
-    model.train()
+    with autocast_ctx:
+        if USE_RECURSIVE:
+            # evaluate_bpb expects a single tensor; RecursiveGPT returns (ce, gate_mean, gate_std) tuple
+            class _CEOnlyModel:
+                def __call__(self, x, y, reduction='mean'):
+                    ce, _, __, ___ = model(x, y, reduction=reduction)
+                    return ce
+            val_bpb = evaluate_bpb(_CEOnlyModel(), tokenizer, DEVICE_BATCH_SIZE)
+        else:
+            val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
 
-final_log = {
-    "final/val_bpb": val_bpb,
-    "final/training_seconds": total_training_time,
-    "final/peak_vram_mb": peak_vram_mb,
-    "final/mfu_percent": steady_state_mfu,
-    "final/total_tokens_M": total_tokens / 1e6,
-    "final/num_steps": step,
-    "final/num_params_M": num_params / 1e6,
-}
-if USE_RECURSIVE:
-    final_log["final/gate_mean"] = final_gate_mean
-    final_log["final/gate_std"] = final_gate_std
-    final_log["final/effective_k"] = 1 + final_gate_mean * (K_RECURSE - 1)
-wandb.log(final_log)
+    # Final summary
+    t_end = time.time()
+    startup_time = t_start_training - t_start
+    steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-# ---------------------------------------------------------------------------
-# Gate threshold sweep (inference compute vs quality trade-off)
-# Only runs when USE_GATE=True and gate actually differentiates tokens (gate_std > 0.05)
-# Uses model._orig_mod to bypass torch.compile — no recompilation needed
-# ---------------------------------------------------------------------------
-if USE_RECURSIVE and USE_GATE and final_gate_std > 0.05 and K_RECURSE > 1:
-    print("\n--- Gate Threshold Sweep (inference compute vs val_bpb) ---")
-    print(f"{'threshold':>10} {'skip%':>8} {'eff_k':>7} {'val_bpb':>12}  note")
-    _orig = getattr(model, '_orig_mod', model)
-    _orig.eval()
-    _token_bytes = get_token_bytes(device=device)
-    _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
-    _sweep_log = {}
-    for _tau in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
-        _total_nats = 0.0; _total_bytes = 0; _total_skip = 0.0
-        _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
-        with torch.no_grad(), autocast_ctx:
-            for _ in range(_sweep_steps):
-                _x, _y, _ = next(_val_loader)
-                _ce, _, __, _sf = _orig(_x.to(device), _y.to(device), reduction='none', gate_threshold=_tau)
-                _loss_flat = _ce.view(-1)
-                _y_flat = _y.view(-1)
-                _nb = _token_bytes[_y_flat]
-                _mask = _nb > 0
-                _total_nats += (_loss_flat * _mask).sum().item()
-                _total_bytes += _nb.sum().item()
-                _total_skip += _sf.item()
-        _bpb = _total_nats / (math.log(2) * _total_bytes)
-        _avg_skip = _total_skip / _sweep_steps
-        _eff_k = 1 + (1 - _avg_skip) * (K_RECURSE - 1)
-        _note = " ← full K=2" if _tau == 0.0 else (" ← K=1 equiv" if _tau == 1.0 else "")
-        print(f"{_tau:>10.1f} {100*_avg_skip:>7.1f}% {_eff_k:>7.2f} {_bpb:>12.6f}{_note}")
-        _sweep_log[f"sweep/tau{_tau:.1f}_bpb"] = _bpb
-        _sweep_log[f"sweep/tau{_tau:.1f}_skip_pct"] = 100 * _avg_skip
-        _sweep_log[f"sweep/tau{_tau:.1f}_eff_k"] = _eff_k
-    print(f"{'P3a ref':>10} {'~50%':>8} {'~1.50':>7} {'1.046300':>12}  RANDOM_K no-gate baseline")
-    wandb.log(_sweep_log)
+    # Compute final gate_mean/gate_std from eval pass if recursive
+    final_gate_mean = 0.0
+    final_gate_std = 0.0
+    if USE_RECURSIVE:
+        model.eval()
+        with autocast_ctx, torch.no_grad():
+            eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
+            ex, ey, _ = next(eval_loader)
+            _, gm, gs, _ = model(ex.to(device), ey.to(device))
+            final_gate_mean = gm.item()
+            final_gate_std = gs.item()
+        model.train()
 
-# ---------------------------------------------------------------------------
-# K-sweep (inference compute vs quality): test K=1..K_RECURSE at inference
-# Only runs for recursive models with K_RECURSE > 1 and no gate (gate would invalidate k_override)
-# ---------------------------------------------------------------------------
-if USE_RECURSIVE and not USE_GATE and K_RECURSE > 1:
-    print("\n--- K Sweep (inference compute vs val_bpb) ---")
-    print(f"{'K':>6} {'eff_depth':>10} {'val_bpb':>12}  note")
-    _orig = getattr(model, '_orig_mod', model)
-    _orig.eval()
-    _token_bytes = get_token_bytes(device=device)
-    _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
-    _ksweep_log = {}
-    for _k in range(1, K_RECURSE + 1):
-        _total_nats = 0.0; _total_bytes = 0
-        _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
-        with torch.no_grad(), autocast_ctx:
-            for _ in range(_sweep_steps):
-                _x, _y, _ = next(_val_loader)
-                _ce, _, __, ___ = _orig(_x.to(device), _y.to(device), reduction='none', k_override=_k)
-                _loss_flat = _ce.view(-1)
-                _y_flat = _y.view(-1)
-                _nb = _token_bytes[_y_flat]
-                _mask = _nb > 0
-                _total_nats += (_loss_flat * _mask).sum().item()
-                _total_bytes += _nb.sum().item()
-        _bpb = _total_nats / (math.log(2) * _total_bytes)
-        _eff_depth = 2 + _k * 4 + 2  # prelude(2) + recur(4)*K + coda(2)
-        _note = " ← trained max K" if _k == K_RECURSE else (" ← min compute" if _k == 1 else "")
-        print(f"{_k:>6} {_eff_depth:>10} {_bpb:>12.6f}{_note}")
-        _ksweep_log[f"ksweep/k{_k}_bpb"] = _bpb
-        _ksweep_log[f"ksweep/k{_k}_eff_depth"] = _eff_depth
-    print(f"  ref: P3a K=2 RANDOM_K val_bpb=1.046300, B1 standard GPT (8 layers) val_bpb=0.996400")
-    wandb.log(_ksweep_log)
+    final_log = {
+        "final/val_bpb": val_bpb,
+        "final/training_seconds": total_training_time,
+        "final/peak_vram_mb": peak_vram_mb,
+        "final/mfu_percent": steady_state_mfu,
+        "final/total_tokens_M": total_tokens / 1e6,
+        "final/num_steps": step,
+        "final/num_params_M": num_params / 1e6,
+    }
+    if USE_RECURSIVE:
+        final_log["final/gate_mean"] = final_gate_mean
+        final_log["final/gate_std"] = final_gate_std
+        final_log["final/effective_k"] = 1 + final_gate_mean * (K_RECURSE - 1)
+    wandb.log(final_log)
 
-# ---------------------------------------------------------------------------
-# Checkpoint save (only for gated recursive runs — needed for eval_gates.py)
-# ---------------------------------------------------------------------------
-if USE_RECURSIVE and USE_GATE:
-    _ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"checkpoint_{RUN_NAME}.pt")
-    _orig_mod = getattr(model, '_orig_mod', model)
-    torch.save(_orig_mod.state_dict(), _ckpt_path)
-    print(f"Saved checkpoint to {_ckpt_path}")
+    # ---------------------------------------------------------------------------
+    # Gate threshold sweep (inference compute vs quality trade-off)
+    # Only runs when USE_GATE=True and gate actually differentiates tokens (gate_std > 0.05)
+    # Uses model._orig_mod to bypass torch.compile — no recompilation needed
+    # ---------------------------------------------------------------------------
+    if USE_RECURSIVE and USE_GATE and final_gate_std > 0.05 and K_RECURSE > 1:
+        print("\n--- Gate Threshold Sweep (inference compute vs val_bpb) ---")
+        print(f"{'threshold':>10} {'skip%':>8} {'eff_k':>7} {'val_bpb':>12}  note")
+        _orig = getattr(model, '_orig_mod', model)
+        _orig.eval()
+        _token_bytes = get_token_bytes(device=device)
+        _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+        _sweep_log = {}
+        for _tau in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 1.0]:
+            _total_nats = 0.0; _total_bytes = 0; _total_skip = 0.0
+            _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
+            with torch.no_grad(), autocast_ctx:
+                for _ in range(_sweep_steps):
+                    _x, _y, _ = next(_val_loader)
+                    _ce, _, __, _sf = _orig(_x.to(device), _y.to(device), reduction='none', gate_threshold=_tau)
+                    _loss_flat = _ce.view(-1)
+                    _y_flat = _y.view(-1)
+                    _nb = _token_bytes[_y_flat]
+                    _mask = _nb > 0
+                    _total_nats += (_loss_flat * _mask).sum().item()
+                    _total_bytes += _nb.sum().item()
+                    _total_skip += _sf.item()
+            _bpb = _total_nats / (math.log(2) * _total_bytes)
+            _avg_skip = _total_skip / _sweep_steps
+            _eff_k = 1 + (1 - _avg_skip) * (K_RECURSE - 1)
+            _note = " ← full K=2" if _tau == 0.0 else (" ← K=1 equiv" if _tau == 1.0 else "")
+            print(f"{_tau:>10.1f} {100*_avg_skip:>7.1f}% {_eff_k:>7.2f} {_bpb:>12.6f}{_note}")
+            _sweep_log[f"sweep/tau{_tau:.1f}_bpb"] = _bpb
+            _sweep_log[f"sweep/tau{_tau:.1f}_skip_pct"] = 100 * _avg_skip
+            _sweep_log[f"sweep/tau{_tau:.1f}_eff_k"] = _eff_k
+        print(f"{'P3a ref':>10} {'~50%':>8} {'~1.50':>7} {'1.046300':>12}  RANDOM_K no-gate baseline")
+        wandb.log(_sweep_log)
 
-wandb.finish()
+    # ---------------------------------------------------------------------------
+    # K-sweep (inference compute vs quality): test K=1..K_RECURSE at inference
+    # Only runs for recursive models with K_RECURSE > 1 and no gate (gate would invalidate k_override)
+    # ---------------------------------------------------------------------------
+    if USE_RECURSIVE and not USE_GATE and K_RECURSE > 1:
+        print("\n--- K Sweep (inference compute vs val_bpb) ---")
+        print(f"{'K':>6} {'eff_depth':>10} {'val_bpb':>12}  note")
+        _orig = getattr(model, '_orig_mod', model)
+        _orig.eval()
+        _token_bytes = get_token_bytes(device=device)
+        _sweep_steps = EVAL_TOKENS // (DEVICE_BATCH_SIZE * MAX_SEQ_LEN)
+        _ksweep_log = {}
+        for _k in range(1, K_RECURSE + 1):
+            _total_nats = 0.0; _total_bytes = 0
+            _val_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "val")
+            with torch.no_grad(), autocast_ctx:
+                for _ in range(_sweep_steps):
+                    _x, _y, _ = next(_val_loader)
+                    _ce, _, __, ___ = _orig(_x.to(device), _y.to(device), reduction='none', k_override=_k)
+                    _loss_flat = _ce.view(-1)
+                    _y_flat = _y.view(-1)
+                    _nb = _token_bytes[_y_flat]
+                    _mask = _nb > 0
+                    _total_nats += (_loss_flat * _mask).sum().item()
+                    _total_bytes += _nb.sum().item()
+            _bpb = _total_nats / (math.log(2) * _total_bytes)
+            _eff_depth = 2 + _k * 4 + 2  # prelude(2) + recur(4)*K + coda(2)
+            _note = " ← trained max K" if _k == K_RECURSE else (" ← min compute" if _k == 1 else "")
+            print(f"{_k:>6} {_eff_depth:>10} {_bpb:>12.6f}{_note}")
+            _ksweep_log[f"ksweep/k{_k}_bpb"] = _bpb
+            _ksweep_log[f"ksweep/k{_k}_eff_depth"] = _eff_depth
+        print(f"  ref: P3a K=2 RANDOM_K val_bpb=1.046300, B1 standard GPT (8 layers) val_bpb=0.996400")
+        wandb.log(_ksweep_log)
 
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {_depth}")
-if USE_RECURSIVE:
-    print(f"gate_mean:        {final_gate_mean:.4f}")
-    print(f"gate_std:         {final_gate_std:.4f}")
-    print(f"effective_k:      {1 + final_gate_mean * (K_RECURSE - 1):.2f}")
+    # ---------------------------------------------------------------------------
+    # Checkpoint save (only for gated recursive runs — needed for eval_gates.py)
+    # ---------------------------------------------------------------------------
+    if USE_RECURSIVE and USE_GATE:
+        _ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"checkpoint_{RUN_NAME}.pt")
+        _orig_mod = getattr(model, '_orig_mod', model)
+        torch.save(_orig_mod.state_dict(), _ckpt_path)
+        print(f"Saved checkpoint to {_ckpt_path}")
 
-# Auto-log to results.tsv
-import subprocess, csv, os as _os
-_commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
-                                   cwd=_os.path.dirname(_os.path.abspath(__file__))).decode().strip()
-_eff_k  = 1 + final_gate_mean * (K_RECURSE - 1) if USE_RECURSIVE else 1.0
-_tsv_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "results.tsv")
-_header = "commit\tval_bpb\tgate_mean\tgate_std\teffective_k\tpeak_vram_mb\tstatus\tdescription\n"
-if not _os.path.exists(_tsv_path):
-    open(_tsv_path, "w").write(_header)
-with open(_tsv_path, "a") as _f:
-    _f.write(f"{_commit}\t{val_bpb:.6f}\t{final_gate_mean:.4f}\t{final_gate_std:.4f}\t{_eff_k:.2f}\t{peak_vram_mb:.1f}\tok\t{RUN_NAME}\n")
-print(f"Logged to results.tsv")
+    wandb.finish()
+
+    print("---")
+    print(f"val_bpb:          {val_bpb:.6f}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"mfu_percent:      {steady_state_mfu:.2f}")
+    print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {num_params / 1e6:.1f}")
+    print(f"depth:            {_depth}")
+    if USE_RECURSIVE:
+        print(f"gate_mean:        {final_gate_mean:.4f}")
+        print(f"gate_std:         {final_gate_std:.4f}")
+        print(f"effective_k:      {1 + final_gate_mean * (K_RECURSE - 1):.2f}")
+
+    # Auto-log to results.tsv
+    import subprocess, csv, os as _os
+    _commit = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                       cwd=_os.path.dirname(_os.path.abspath(__file__))).decode().strip()
+    _eff_k  = 1 + final_gate_mean * (K_RECURSE - 1) if USE_RECURSIVE else 1.0
+    _tsv_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "results.tsv")
+    _header = "commit\tval_bpb\tgate_mean\tgate_std\teffective_k\tpeak_vram_mb\tstatus\tdescription\n"
+    if not _os.path.exists(_tsv_path):
+        open(_tsv_path, "w").write(_header)
+    with open(_tsv_path, "a") as _f:
+        _f.write(f"{_commit}\t{val_bpb:.6f}\t{final_gate_mean:.4f}\t{final_gate_std:.4f}\t{_eff_k:.2f}\t{peak_vram_mb:.1f}\tok\t{RUN_NAME}\n")
+    print(f"Logged to results.tsv")
