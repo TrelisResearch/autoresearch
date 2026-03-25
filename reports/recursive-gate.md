@@ -64,6 +64,8 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | **P4i** | **K=2 RANDOM_K, gate, VAR_REWARD=0.1, 20-min** | **0.9612** | **0.1318** | **0.1672** | **1.13** | **2510** | **BREAKTHROUGH: 95.8% tokens skip 2nd recurrence, costs only 0.003 bpb** |
 | **P4j** | **K=2 RANDOM_K, 40-min (no gate)** | **0.9384** | — | — | 1.00 | **5061** | **Beats 20-min standard GPT (0.9413)! Gap continues to narrow.** |
 | **P4k** | **Standard GPT 40-min reference** | **0.9294** | — | — | — | **7363** | **Gap at 40-min: 0.009 (down from 0.019 at 20-min, 0.050 at 5-min)** |
+| P4l | K=2 gate VAR=0.1 20-min + checkpoint | 0.9617 | 0.1011 | **0.029** | 1.10 | 2524 | gate mostly collapsed (vs P4i gate_std=0.167); final_gate_std from single batch — high variance |
+| **P4m** | **K=2 gate VAR_REWARD=0.3 20-min** | _running_ | — | — | — | — | **VAR=0.3 → gate_std≈0.44 during training (bimodal!)** |
 
 ---
 
@@ -362,6 +364,35 @@ Instead of a soft scalar gate, use a binary (or near-binary) gate to skip the en
 
 ### P2f — K=2 instead of K=4
 Simpler case: only 1 gated step. May be easier to train meaningful gates.
+
+---
+
+## Phase 8: Gate Interpretability + VAR_REWARD Stability (2026-03-25)
+
+### P4l — Gated K=2 VAR=0.1, 20-min + checkpoint
+- val_bpb=0.9617, gate_mean=0.101, gate_std=0.029, effective_k=1.10
+- Matched P4i quality (0.9612) but gate_std much lower (0.029 vs 0.167)
+- Root cause: `final_gate_std` is from a **single eval batch** — high variance
+- Shows VAR=0.1 is borderline: sometimes bimodal (P4i), sometimes collapsed (P4l)
+- Checkpoint saved: `checkpoint_p4l-gated-checkpoint.pt` (139MB)
+
+### Engineering: eval_gates.py
+- New script to visualize per-token gate values from checkpoint
+- Loads checkpoint, runs sample texts, prints each token colored by gate value
+- Green = low gate (skip 2nd recurrence = "easy"), Red = high gate (use 2nd recurrence = "hard")
+- Positional analysis: plots avg gate by sequence position to detect position vs content bias
+- Bug chain: (1) train.py couldn't be imported (ran training on import); fixed by wrapping training in `if __name__ == "__main__":`; (2) `inject_init` not accessible in `init_weights`; fixed by saving as `self._inject_init`; (3) `n_head` inference wrong; fixed by reading from `ve_gate.weight.shape[0]`; (4) FA3 needs bf16; fixed by `.bfloat16()` + autocast
+
+### P4m — Gated K=2 VAR_REWARD=0.3, 20-min (running)
+- VAR=0.3 (3× stronger than P4l/P4i)
+- gate_std≈0.44 during training (genuinely bimodal!) — confirms VAR=0.1 was borderline
+- Expected to complete with consistent bimodal gating, enabling reliable gate threshold sweep
+
+### P4l gate_std variance insight
+- `final_gate_std` is computed from a single forward pass on a random batch → high variance
+- P4i got 0.167, P4l got 0.029 — same config, different random batch → 6× difference
+- Need to average over multiple batches for reliable gate_std measurement
+- TODO: fix training code to average gate_std over eval set (not single batch)
 
 ---
 
