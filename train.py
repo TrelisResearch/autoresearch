@@ -776,26 +776,26 @@ if __name__ == "__main__":
     DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
     # Recursive architecture
-    USE_RECURSIVE  = True   # P4m: gated recursive VAR=0.3 — test if higher VAR fixes gate collapse vs P4l
-    K_RECURSE      = 2      # K=2
-    USE_GATE          = True   # gate enabled
-    GATE_FROM_PRELUDE = True   # gate from prelude e
+    USE_RECURSIVE  = True   # P4n: K=2 RANDOM_K no gate, 80-min — extend compute scaling curve
+    K_RECURSE      = 2      # K=2 (same as P4a/P4j)
+    USE_GATE          = False  # no gate — clean scaling curve
+    GATE_FROM_PRELUDE = True
     GATE_FROM_DIFF    = False
     GATE_MIN          = 0.1
     GATE_MIN_INIT     = 0.1
     LAMBDA_GATE       = 0.0
-    VAR_REWARD        = 0.3    # P4m: 3× stronger than P4l (0.1) — should force more bimodal gate
+    VAR_REWARD        = 0.0    # no VAR reward — no gate
     STEP_EMBED_SCALE  = 0.1
     INJECT_INIT       = "identity"
     LORA_RANK         = 0
     LORA_LR           = 0.004
-    RANDOM_K          = True
+    RANDOM_K          = True   # K=2 RANDOM_K for more steps
     USE_GRAD_CKPT  = True
     # When USE_RECURSIVE=True: DEPTH is set to PRELUDE+RECUR+CODA=8 automatically
 
     # Experiment tracking
-    TIME_BUDGET = _BASE_TIME_BUDGET * 4  # 20-min
-    RUN_NAME = "p4m-var0.3-gate"  # P4m: gated K=2 VAR_REWARD=0.3, diagnose gate collapse from P4l
+    TIME_BUDGET = _BASE_TIME_BUDGET * 16  # 80-min: next point on compute scaling curve
+    RUN_NAME = "p4n-recursive-80min"  # P4n: K=2 RANDOM_K 80-min; extrapolated gap≈0.004 (vs 0.009 at 40-min)
     WANDB_PROJECT = "autoresearch-recursive-gate"
 
     # ---------------------------------------------------------------------------
@@ -1027,17 +1027,22 @@ if __name__ == "__main__":
     steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-    # Compute final gate_mean/gate_std from eval pass if recursive
+    # Compute final gate_mean/gate_std averaged over 20 eval batches (single batch is noisy)
     final_gate_mean = 0.0
     final_gate_std = 0.0
     if USE_RECURSIVE:
+        _n_gate_batches = 20
         model.eval()
         with autocast_ctx, torch.no_grad():
             eval_loader = make_dataloader(tokenizer, min(DEVICE_BATCH_SIZE, 32), MAX_SEQ_LEN, "val")
-            ex, ey, _ = next(eval_loader)
-            _, gm, gs, _ = model(ex.to(device), ey.to(device))
-            final_gate_mean = gm.item()
-            final_gate_std = gs.item()
+            _gm_sum, _gs_sum = 0.0, 0.0
+            for _ in range(_n_gate_batches):
+                ex, ey, _ = next(eval_loader)
+                _, gm, gs, _ = model(ex.to(device), ey.to(device))
+                _gm_sum += gm.item()
+                _gs_sum += gs.item()
+            final_gate_mean = _gm_sum / _n_gate_batches
+            final_gate_std = _gs_sum / _n_gate_batches
         model.train()
 
     final_log = {
