@@ -1134,9 +1134,9 @@ if __name__ == "__main__":
         wandb.log(_ksweep_log)
 
     # ---------------------------------------------------------------------------
-    # Checkpoint save (only for gated recursive runs — needed for eval_gates.py)
+    # Checkpoint save (all recursive runs — needed for eval_gates.py K-sweep)
     # ---------------------------------------------------------------------------
-    if USE_RECURSIVE and USE_GATE:
+    if USE_RECURSIVE:
         _ckpt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"checkpoint_{RUN_NAME}.pt")
         _orig_mod = getattr(model, '_orig_mod', model)
         torch.save(_orig_mod.state_dict(), _ckpt_path)
