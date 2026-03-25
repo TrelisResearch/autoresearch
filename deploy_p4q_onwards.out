@@ -1,0 +1,13 @@
+=== [1] Wait for P4p (VAR=0.2 gate 20-min, already running) ===
+[Wed Mar 25 01:19:43 PM UTC 2026] Waiting for P4p (log: /workspace/run_p4p.log)...
+[Wed Mar 25 01:41:48 PM UTC 2026] P4p FINISHED.
+val_bpb:          0.967333
+peak_vram_mb:     36075.8
+  P4p: val_bpb=0.967333  
+  [eval_gates: checkpoint not found: checkpoint_p4p-var0.2-gate.pt]
+
+=== [2] Deploy P4q (VAR=0.3+LAMBDA=0.15, target 75% skip) ===
+[Wed Mar 25 01:43:47 PM UTC 2026] Deploying P4q (commit e974e95)...
+error: cannot lock ref 'refs/remotes/trelis/recursive-gate': is at 823ecdc8b661468338427185f1fc88e04daf4427 but expected c52ff6d95432fbe7bea3318459bab526d42ad0b2
+From https://github.com/TrelisResearch/autoresearch
+ ! c52ff6d..823ecdc  recursive-gate -> trelis/recursive-gate  (unable to update local ref)

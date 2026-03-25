@@ -1,0 +1,16 @@
+=== [1] Wait for P4q (VAR=0.3+LAMBDA=0.15 20-min, already running) ===
+[Wed Mar 25 01:50:21 PM UTC 2026] Waiting for P4q (log: /workspace/run_p4q.log)...
+[Wed Mar 25 02:13:33 PM UTC 2026] P4q FINISHED.
+val_bpb:          1.000515
+peak_vram_mb:     36075.8
+  P4q: val_bpb=1.000515  
+eval_gates_launched
+  [eval_gates: checkpoint_p4q-var0.3-lambda0.15.pt not found]
+
+=== [2] Deploy P4r (K=2 gate 80-min) ===
+[Wed Mar 25 02:15:25 PM UTC 2026] Deploying P4r (commit 33b8a1e)...
+launched
+[Wed Mar 25 03:44:24 PM UTC 2026] P4r launched → /workspace/run_p4r.log
+
+=== [3] Wait for P4r (80-min) ===
+[Wed Mar 25 03:44:24 PM UTC 2026] Waiting for P4r (log: /workspace/run_p4r.log)...

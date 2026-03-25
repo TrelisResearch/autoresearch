@@ -1,0 +1,45 @@
+=== [1] Wait for P4s (K=4 gate 20-min, already running) ===
+[Wed Mar 25 04:07:13 PM UTC 2026] Waiting for P4s (log: /workspace/run_p4s.log)...
+[Wed Mar 25 04:30:23 PM UTC 2026] P4s FINISHED.
+val_bpb:          0.971051
+peak_vram_mb:     55488.8
+  P4s: val_bpb=0.971051  
+  [eval_gates: checkpoint_p4s-k4-gate-20min.pt not found or launch failed]
+
+=== [2] Deploy P4u (K=2 gate_from_postlude0 20-min) ===
+[Wed Mar 25 04:30:32 PM UTC 2026] Deploying P4u (commit 781ddb5)...
+files updated
+launched PID:1626200
+[Wed Mar 25 04:30:39 PM UTC 2026] P4u launched → /workspace/run_p4u.log
+
+=== [3] Wait for P4u ===
+[Wed Mar 25 04:30:39 PM UTC 2026] Waiting for P4u (log: /workspace/run_p4u.log)...
+[Wed Mar 25 04:57:07 PM UTC 2026] P4u FINISHED.
+val_bpb:          0.961003
+peak_vram_mb:     36100.2
+  P4u: val_bpb=0.961003  
+eval_gates_launched
+
+=== [4] Deploy P4t (K=4 gate 80-min) ===
+[Wed Mar 25 04:57:16 PM UTC 2026] Deploying P4t (commit 979bfd7)...
+files updated
+launched PID:1768902
+[Wed Mar 25 04:57:23 PM UTC 2026] P4t launched → /workspace/run_p4t.log
+
+=== [5] Wait for P4t (80-min) ===
+[Wed Mar 25 04:57:23 PM UTC 2026] Waiting for P4t (log: /workspace/run_p4t.log)...
+[Wed Mar 25 06:23:35 PM UTC 2026] P4t FINISHED.
+val_bpb:          0.928655
+peak_vram_mb:     55488.8
+  P4t: val_bpb=0.928655  
+eval_gates_launched
+
+===========================================
+=== ALL EXPERIMENTS COMPLETE ===
+===========================================
+P4n (K=2 no-gate 80-min):           val_bpb=0.9254
+P4o (standard GPT 80-min):          val_bpb=0.9244
+P4r (K=2 gate VAR=0.3+L=0.15 80m): val_bpb=0.9326  [+0.007 vs P4n]
+P4s (K=4 gate 20-min):              val_bpb=0.971051
+P4u (K=2 postlude0 gate 20-min):    val_bpb=0.961003
+P4t (K=4 gate 80-min):              val_bpb=0.928655
