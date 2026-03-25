@@ -53,6 +53,13 @@ prelude (2 layers, once) → recur (4 layers, shared weights, ×K) → coda (2 l
 | P3R2 | symmetric inject, var_reward=0, gate_min=0.3 (forced open) | 1.0433 | 0.3009 | 0.002 | 1.20 | 641 | no VAR_REWARD → gate_std≈0; uniform forced compute doesn't help vs floor |
 | P3S | identity inject, var_reward=0.5 | 1.0551 | 0.5430 | 0.4499 | 1.54 | 638 | **ablation: VAR_REWARD=0.5 alone sufficient — symmetric inject NOT required** |
 | P3P2 | symmetric inject, var_reward=0.5 + **threshold sweep** | 1.0563 | 0.5352 | 0.4497 | 1.54 | 629 | Gate threshold sweep — see Phase 4 |
+| **P4a** | **20-min, no VAR_REWARD, K=2 RANDOM_K, gate collapsed** | **0.9603** | **0.1001** | **0.000** | **1.10** | **2521** | **Beats 5-min standard GPT (0.9964)! Gate still collapsed** |
+| **P4b** | **20-min standard GPT** | **0.9413** | — | — | — | **3728** | **iso-time: standard GPT beats recursive but gap narrows (0.050→0.019 vs 5min)** |
+| P4c | K=2 fixed (no RANDOM_K), inject LoRA rank=4, gate on | 2.0175 | 0.1001 | 0.000 | 1.10 | ~535 | FAIL: gate collapsed step 2; LoRA LR bug (0.61→explosion) |
+| P4d | K=2 RANDOM_K, inject LoRA rank=2, no gate | 2.2020 | — | — | — | ~635 | FAIL: same LoRA LR bug (0.61) |
+| P4e | K=2 RANDOM_K, LoRA rank=4, LR=0.004 (fixed) | 1.0470 | — | — | 1.00 | ~632 | LR fix works; LoRA neutral vs P3a |
+| P4f | K=2 fixed, LoRA rank=8, LR=0.02 | 1.0789 | — | — | 1.00 | ~535 | LR spike at step 138 hurt; 0.02 still too high |
+| **P4g** | **K=4 RANDOM_K, no gate — Phase 3 K-sweep** | **1.0797** | — | — | — | **468** | **K-sweep: K=1→1.089, K=2→1.082, K=3→1.080, K=4→1.080** |
 
 ---
 
@@ -205,6 +212,55 @@ When gate < τ: token skips second recurrence (g set to 0 → s unchanged). Meas
 5. **The gate IS adaptive**: model genuinely learned to split tokens into "needs more compute" (49%) vs "doesn't" (51%). Hypothesis: this split would emerge naturally with longer training, making VAR_REWARD unnecessary.
 
 **Compute savings at τ=0.5**: effectively 1.49 recurrences vs P3a's ~1.5. Comparable compute, but gated model is worse due to VAR_REWARD noise. The approach works architecturally; the training signal needs improvement.
+
+---
+
+## Phase 5: Longer Runs
+
+### P4a — 20-min recursive (no gate, gate collapsed)
+- **val_bpb: 0.9603**, 2521 steps, 1321M tokens, gate_mean=0.1001 (floor)
+- Beats 5-min standard GPT (0.9964) — longer training massively helps
+- Gate STILL collapses to floor despite 4× more training → longer training alone does NOT fix gate collapse without VAR_REWARD
+- MFU: 36.6%
+
+### P4b — 20-min standard GPT (iso-time baseline)
+- **val_bpb: 0.9413**, 3728 steps, MFU: 39.2%
+- Standard GPT at 20 min beats recursive at 20 min (0.941 vs 0.960)
+- **But the gap is narrowing**: 5-min gap = 0.050 bpb, 20-min gap = 0.019 bpb
+- At even longer training, recursive model may close the gap further
+
+**Key insight**: The recursive architecture benefits more from each additional token than standard GPT — the shared weights can keep improving as training progresses because the same weights are applied multiple times per forward pass. The step-count disadvantage (~32% fewer steps) is the dominant factor, but it matters less over longer training.
+
+---
+
+## Phase 6: LoRA and K-Sweep Experiments
+
+### P4e/P4f — LoRA per-step inject (failed to beat P3a)
+- **LoRA LR bug (root cause for all prior LoRA failures)**: LoRA used `scalar_lr * dmodel_lr_scale = 0.5 * 1.22 = 0.61`. After 100 steps, lora_B magnitude ≈ 61, overwhelming inject output → catastrophic loss spikes.
+- **Fix**: use `unembedding_lr * dmodel_lr_scale ≈ 0.004` for LoRA params (same as lm_head, also a dense matrix).
+- **P4e (fixed LR=0.004)**: val_bpb=1.047 — exactly neutral vs P3a (1.046). LoRA doesn't help when LR is too low for step specialization to emerge.
+- **P4f (LR=0.02)**: val_bpb=1.079 — worse due to LR spike at step 138 (loss 3.91→4.13). 0.02 is still too high.
+- **Conclusion**: LoRA on inject doesn't improve over plain recursion in 5-min budget. The inject layer is already expressive; LoRA adds optimization complexity without payoff.
+
+### P4g — K=4, RANDOM_K: Phase 3 Inference K-Sweep
+- **Training**: K_RECURSE=4, RANDOM_K=True, no gate, 5-min budget → **468 steps** (vs 632 for K=2 P3a)
+- **val_bpb at K=4 inference: 1.0797** (worse than P3a 1.046 due to fewer steps)
+
+**Inference K-sweep confirms quality scales with compute:**
+
+| K (inference) | Eff. depth | val_bpb | Δ vs K=1 |
+|---|---|---|---|
+| 1 | 8 | 1.0892 | — |
+| 2 | 12 | 1.0817 | −0.0075 |
+| 3 | 16 | 1.0800 | −0.0092 |
+| 4 | 20 | 1.0797 | −0.0095 |
+
+**Key findings:**
+1. **More recurrences DO help**: K=1→K=4 improves by 0.0095 bpb (confirms user's nanochat experience).
+2. **Diminishing returns**: K=1→K=2 gain = 0.0075; K=2→K=3 = 0.0017; K=3→K=4 = 0.0003.
+3. **Step-count dominates at 5 min**: K=4 RANDOM_K gets 468 steps vs K=2's 632 (26% fewer). The step-count disadvantage (-0.033 bpb) outweighs the K benefit (+0.009 bpb).
+4. **At longer training, K=4 may win**: the K quality gain is real; at 20+ min where step-count gap shrinks, K=4 inference should pull ahead.
+5. **Graceful compute-quality tradeoff**: the recursive model can run at K=1 for 1.089 or K=4 for 1.080 at inference — the model provides a real latency/quality dial.
 
 ---
 
